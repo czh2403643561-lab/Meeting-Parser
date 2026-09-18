@@ -8,7 +8,7 @@ import re
 import threading
 import uuid
 from http import HTTPStatus
-from http.server import BaseHTTPRequestHandler, HTTPServer
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlsplit, parse_qs
@@ -19,6 +19,8 @@ PORT = 8765
 CHUNK_SIZE = 1024 * 1024
 MAX_JSON_BYTES = 256 * 1024
 MAX_HEADER_VALUE_LENGTH = 8192
+LOG_BYTES_STEP = 50 * 1024 * 1024
+LOG_PERCENT_STEP = 5
 
 ALLOWED_HEADERS = {
     "accept",
@@ -117,6 +119,37 @@ def is_bad_content_type(value: str) -> bool:
     return content_type.startswith(BAD_CONTENT_TYPES)
 
 
+def content_range_info(value: str) -> tuple[int, int, int | None] | None:
+    match = re.fullmatch(r"bytes\s+(\d+)-(\d+)/(\d+|\*)", (value or "").strip(), re.IGNORECASE)
+    if not match:
+        return None
+    total = None if match.group(3) == "*" else int(match.group(3))
+    return int(match.group(1)), int(match.group(2)), total
+
+
+def progress_for(downloaded: int, total: int | None) -> float | None:
+    if total is None or total <= 0:
+        return None
+    return round(min(100.0, max(0.0, downloaded * 100 / total)), 1)
+
+
+def format_bytes(value: int) -> str:
+    return f"{value / (1024 * 1024):.1f} MB"
+
+
+def log_progress(downloaded: int, total: int | None, last_bytes: int, last_progress: float) -> tuple[int, float]:
+    progress = progress_for(downloaded, total)
+    if progress is not None:
+        if progress < last_progress + LOG_PERCENT_STEP and progress < 100:
+            return last_bytes, last_progress
+        print(f"[task] downloading: {format_bytes(downloaded)} / {format_bytes(total)} ({progress:.0f}%)", flush=True)
+        return downloaded, progress
+    if downloaded - last_bytes >= LOG_BYTES_STEP:
+        print(f"[task] downloading: {format_bytes(downloaded)}", flush=True)
+        return downloaded, last_progress
+    return last_bytes, last_progress
+
+
 def update_task(task_id: str, **changes: object) -> None:
     with TASKS_LOCK:
         task = TASKS.get(task_id)
@@ -128,11 +161,6 @@ def task_snapshot(task_id: str) -> dict | None:
     with TASKS_LOCK:
         task = TASKS.get(task_id)
         return dict(task) if task else None
-
-
-def has_active_task() -> bool:
-    with TASKS_LOCK:
-        return any(task["status"] in {"queued", "downloading"} for task in TASKS.values())
 
 
 def unique_target(filename: str) -> Path:
@@ -170,12 +198,17 @@ class SafeRedirectHandler(HTTPRedirectHandler):
 def run_download(task_id: str, url: str, headers: dict[str, str], filename: str) -> None:
     target: Path | None = None
     part: Path | None = None
+    total = 0
+    total_bytes: int | None = None
+    last_log_bytes = 0
+    last_log_progress = 0
     try:
-        update_task(task_id, status="downloading")
+        print(f"[task] started: {filename}", flush=True)
         target = unique_target(filename)
         part = target.with_name(target.name + ".part")
         request = Request(url, headers=headers, method="GET")
         opener = build_opener(SafeRedirectHandler())
+        update_task(task_id, status="connecting")
 
         try:
             response = opener.open(request, timeout=45)
@@ -192,10 +225,26 @@ def run_download(task_id: str, url: str, headers: dict[str, str], filename: str)
             content_type = response.headers.get("Content-Type", "")
             if is_bad_content_type(content_type):
                 raise DownloadError("服务器返回了错误文本而不是 MP4，未保存文件。")
-            content_length = response.headers.get("Content-Length")
-            expected_size = int(content_length) if content_length and content_length.isdigit() else None
+            content_length = response.headers.get("Content-Length", "")
+            response_length = int(content_length) if content_length.isdigit() else None
+            content_range = content_range_info(response.headers.get("Content-Range", ""))
+            if status == HTTPStatus.PARTIAL_CONTENT and content_range:
+                range_start, range_end, range_total = content_range
+                total_bytes = range_total if range_total is not None else response_length
+                expected_response_bytes = range_end - range_start + 1
+                if range_start != 0 or (range_total is not None and range_end + 1 != range_total):
+                    raise DownloadError("服务器只返回了部分媒体内容，未保存文件。")
+            else:
+                total_bytes = response_length
+                expected_response_bytes = response_length
 
-            total = 0
+            update_task(
+                task_id,
+                status="downloading",
+                totalBytes=total_bytes,
+                progress=progress_for(0, total_bytes),
+            )
+
             with part.open("wb") as output:
                 while True:
                     chunk = response.read(CHUNK_SIZE)
@@ -203,36 +252,62 @@ def run_download(task_id: str, url: str, headers: dict[str, str], filename: str)
                         break
                     output.write(chunk)
                     total += len(chunk)
-                    update_task(task_id, bytes=total)
+                    progress = progress_for(total, total_bytes)
+                    update_task(task_id, bytes=total, totalBytes=total_bytes, progress=progress)
+            last_log_bytes, last_log_progress = log_progress(
+                total, total_bytes, last_log_bytes, last_log_progress
+            )
 
-            if expected_size is not None and total != expected_size:
+            if expected_response_bytes is not None and total != expected_response_bytes:
+                raise DownloadError("媒体响应不完整，未保存文件。")
+            if total_bytes is not None and total != total_bytes:
                 raise DownloadError("媒体响应不完整，未保存文件。")
 
         os.replace(part, target)
-        update_task(task_id, status="complete", filename=target.name, bytes=total, error="")
-    except Exception as error:  # The task must always become observable by the popup.
+        update_task(
+            task_id,
+            status="complete",
+            filename=target.name,
+            bytes=total,
+            totalBytes=total_bytes,
+            progress=100.0,
+            error="",
+        )
+        print(f"[task] completed: {target.name}", flush=True)
+    except Exception as error:  # The task must always remain observable by the side panel.
         if part is not None:
             try:
                 part.unlink(missing_ok=True)
             except OSError:
                 pass
         message = error.args[0] if isinstance(error, DownloadError) and error.args else "下载失败。"
-        update_task(task_id, status="failed", error=str(message), filename=safe_filename(filename))
+        update_task(
+            task_id,
+            status="failed",
+            error=str(message),
+            filename=safe_filename(filename),
+            bytes=total,
+            totalBytes=total_bytes,
+            progress=progress_for(total, total_bytes),
+        )
+        print(f"[task] failed: {message}", flush=True)
 
 
 def create_download(payload: dict) -> tuple[str, str]:
-    if has_active_task():
-        raise DownloadError("已有下载任务正在进行，请稍后再试。")
     url = validate_url(payload.get("url"))
     filename = safe_filename(payload.get("filename", "video.mp4"))
     headers = filter_request_headers(payload.get("headers", {}))
     task_id = uuid.uuid4().hex
     with TASKS_LOCK:
+        if any(task["status"] in {"queued", "connecting", "downloading"} for task in TASKS.values()):
+            raise DownloadError("已有下载任务正在进行，请稍后再试。")
         TASKS[task_id] = {
             "taskId": task_id,
             "status": "queued",
             "filename": filename,
             "bytes": 0,
+            "totalBytes": None,
+            "progress": None,
             "error": "",
         }
     worker = threading.Thread(target=run_download, args=(task_id, url, headers, filename), daemon=True)
@@ -292,7 +367,7 @@ class DownloaderHandler(BaseHTTPRequestHandler):
 
 
 def run_server() -> None:
-    server = HTTPServer((HOST, PORT), DownloaderHandler)
+    server = ThreadingHTTPServer((HOST, PORT), DownloaderHandler)
     print(f"Local downloader listening on http://{HOST}:{PORT}")
     try:
         server.serve_forever()

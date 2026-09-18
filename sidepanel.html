@@ -4,7 +4,7 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>媒体资源嗅探器</title>
-    <link rel="stylesheet" href="popup.css" />
+    <link rel="stylesheet" href="sidepanel.css" />
   </head>
   <body>
     <main>
@@ -15,9 +15,20 @@
         </div>
         <button id="refresh" type="button">刷新</button>
       </header>
+
+      <section id="download-area" class="download-area" hidden>
+        <div class="download-heading">
+          <strong>当前下载</strong>
+          <button id="clear-download" class="secondary-button" type="button" hidden>清除记录</button>
+        </div>
+        <p id="download-status" role="status"></p>
+        <progress id="download-progress" max="100" value="0" hidden></progress>
+        <p id="download-size"></p>
+      </section>
+
       <p id="status" role="status"></p>
       <section id="candidates" aria-live="polite"></section>
     </main>
-    <script src="popup.js"></script>
+    <script src="sidepanel.js"></script>
   </body>
 </html>

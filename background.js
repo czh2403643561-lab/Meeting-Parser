@@ -14,8 +14,13 @@ const LOCAL_FORWARD_HEADERS = new Set([
   "referer",
   "user-agent"
 ]);
+const ACTIVE_DOWNLOAD_KEY = "activeDownload";
 const candidateIdsByUrl = new Map();
 const candidateUrlsById = new Map();
+
+if (chrome.sidePanel?.setPanelBehavior) {
+  void chrome.sidePanel.setPanelBehavior({ openPanelOnActionClick: true });
+}
 
 function candidatesKey(tabId) {
   return `mediaCandidates:${tabId}`;
@@ -423,6 +428,13 @@ async function startLocalDownload(message) {
       headers: localDownloadHeaders(context)
     })
   });
+  await saveActiveDownload({
+    taskId: result.taskId,
+    tabId: message.tabId,
+    filename: result.filename,
+    startedAt: new Date().toISOString(),
+    status: result.status || "queued"
+  });
   return { taskId: result.taskId, filename: result.filename, status: result.status };
 }
 
@@ -431,6 +443,39 @@ async function getLocalDownloadStatus(taskId) {
     throw new Error("本地下载任务编号无效。");
   }
   return localDownloaderRequest(`/status?id=${encodeURIComponent(taskId)}`);
+}
+
+async function saveActiveDownload(activeDownload) {
+  await chrome.storage.session.set({ [ACTIVE_DOWNLOAD_KEY]: activeDownload });
+}
+
+async function updateActiveDownloadStatus(taskId, status) {
+  const result = await chrome.storage.session.get(ACTIVE_DOWNLOAD_KEY);
+  const active = result[ACTIVE_DOWNLOAD_KEY];
+  if (!active || active.taskId !== taskId || !status?.status) return;
+  await saveActiveDownload({ ...active, status: status.status });
+}
+
+async function getActiveDownload() {
+  const result = await chrome.storage.session.get(ACTIVE_DOWNLOAD_KEY);
+  const active = result[ACTIVE_DOWNLOAD_KEY];
+  if (!active?.taskId) return null;
+
+  try {
+    const latest = await getLocalDownloadStatus(active.taskId);
+    await updateActiveDownloadStatus(active.taskId, latest);
+    return { ...active, ...latest };
+  } catch {
+    return {
+      ...active,
+      serviceError: "本地下载器已停止，无法获取当前任务状态。"
+    };
+  }
+}
+
+async function clearActiveDownload() {
+  await chrome.storage.session.remove(ACTIVE_DOWNLOAD_KEY);
+  return { ok: true };
 }
 
 async function savePageMetadata(tabId, metadata) {
@@ -472,6 +517,23 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
 
   if (message?.type === "getLocalDownloadStatus") {
     getLocalDownloadStatus(message.taskId)
+      .then(async (status) => {
+        await updateActiveDownloadStatus(message.taskId, status);
+        sendResponse(status);
+      })
+      .catch((error) => sendResponse({ error: error.message }));
+    return true;
+  }
+
+  if (message?.type === "getActiveDownload") {
+    getActiveDownload()
+      .then((status) => sendResponse(status))
+      .catch((error) => sendResponse({ error: error.message }));
+    return true;
+  }
+
+  if (message?.type === "clearActiveDownload") {
+    clearActiveDownload()
       .then((status) => sendResponse(status))
       .catch((error) => sendResponse({ error: error.message }));
     return true;
