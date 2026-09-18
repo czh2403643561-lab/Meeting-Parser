@@ -9,9 +9,12 @@ const diagnosticResults = document.querySelector("#diagnostic-results");
 const diagnosticPage = document.querySelector("#diagnostic-page");
 const diagnosticVideo = document.querySelector("#diagnostic-video");
 const diagnosticTranscript = document.querySelector("#diagnostic-transcript");
-const diagnosticBlockCount = document.querySelector("#diagnostic-block-count");
+const diagnosticParagraphCount = document.querySelector("#diagnostic-paragraph-count");
 const diagnosticTextLength = document.querySelector("#diagnostic-text-length");
 const diagnosticPreview = document.querySelector("#diagnostic-preview");
+const diagnosticActions = document.querySelector("#diagnostic-actions");
+const copyTranscriptButton = document.querySelector("#copy-transcript");
+const exportTranscriptButton = document.querySelector("#export-transcript");
 const downloadArea = document.querySelector("#download-area");
 const downloadStatusElement = document.querySelector("#download-status");
 const downloadProgress = document.querySelector("#download-progress");
@@ -83,6 +86,7 @@ const setupDownloadWaiters = new Map();
 let onboardingNeedsUpdate = false;
 const COLLAPSE_STATE_KEY = "sidePanelCollapseState";
 let collapseState = {};
+let latestTranscript = null;
 
 if (chrome.downloads?.onChanged) {
   chrome.downloads.onChanged.addListener((delta) => {
@@ -796,6 +800,7 @@ async function refresh() {
 
 function renderPageDiagnostic(result, tab) {
   const transcript = result?.transcriptFound ? result : null;
+  latestTranscript = transcript;
   const pageTitle = result?.pageTitle || tab?.title || "未读取";
   const pageUrl = result?.pageUrl || tab?.url || "";
   const pageKind = result?.pageDetected ? "是" : "否";
@@ -803,9 +808,10 @@ function renderPageDiagnostic(result, tab) {
   diagnosticPage.title = result?.pageUrl || tab?.url || "";
   diagnosticVideo.textContent = `${result?.videoCount ?? 0} 个视频元素`;
   diagnosticTranscript.textContent = transcript ? "已发现疑似正文" : "未发现疑似正文";
-  diagnosticBlockCount.textContent = transcript ? String(transcript.blockCount ?? 0) : "—";
+  diagnosticParagraphCount.textContent = transcript ? String(transcript.paragraphCount ?? 0) : "—";
   diagnosticTextLength.textContent = transcript ? String(transcript.textLength ?? 0) : "—";
-  diagnosticPreview.textContent = transcript?.preview || "—";
+  diagnosticPreview.textContent = transcript?.fullText?.slice(0, 500) || transcript?.preview || "—";
+  diagnosticActions.hidden = !transcript;
   diagnosticResults.hidden = false;
 }
 
@@ -828,6 +834,32 @@ async function runPageDiagnostic() {
     runPageDiagnosticButton.disabled = false;
   }
 }
+
+copyTranscriptButton.addEventListener("click", async () => {
+  if (!latestTranscript?.fullText) return;
+  copyTranscriptButton.disabled = true;
+  try {
+    await navigator.clipboard.writeText(latestTranscript.fullText);
+    diagnosticFeedback.textContent = "逐字稿全文已复制。";
+  } catch {
+    diagnosticFeedback.textContent = "复制失败，请检查浏览器剪贴板权限。";
+  } finally {
+    copyTranscriptButton.disabled = false;
+  }
+});
+
+exportTranscriptButton.addEventListener("click", () => {
+  if (!latestTranscript?.fullText) return;
+  exportTranscriptButton.disabled = true;
+  const objectUrl = URL.createObjectURL(new Blob(["\uFEFF", latestTranscript.fullText], { type: "text/plain;charset=utf-8" }));
+  const filename = `meeting-transcript-${logExportTimestamp()}.txt`;
+  chrome.downloads.download({ url: objectUrl, filename, saveAs: true }, () => {
+    const error = chrome.runtime.lastError;
+    URL.revokeObjectURL(objectUrl);
+    diagnosticFeedback.textContent = error ? "导出失败，请重试。" : `已导出：${filename}`;
+    exportTranscriptButton.disabled = false;
+  });
+});
 
 clearDownloadButton.addEventListener("click", async () => {
   stopMonitoring();

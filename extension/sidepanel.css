@@ -446,6 +446,12 @@ code {
   padding-top: 12px;
 }
 
+.diagnostic-actions {
+  display: flex;
+  gap: 8px;
+  margin-top: 12px;
+}
+
 .diagnostic-results {
   margin: 12px 0 0;
 }
