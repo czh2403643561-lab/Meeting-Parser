@@ -145,15 +145,53 @@ button:disabled {
   background: #e49b25;
 }
 
-.local-service-status[data-state="not-installed"] {
+.local-service-status[data-state="not-installed"],
+.local-service-status[data-state="update-required"] {
+  border-color: #f2d7b6;
+  color: #9a5d11;
+  background: #fff8ec;
+}
+
+.local-service-status[data-state="waiting-install"] {
   border-color: #f2d7b6;
   color: #9a5d11;
   background: #fff8ec;
 }
 
 .local-service-status[data-state="not-installed"]::before,
+.local-service-status[data-state="update-required"]::before,
+.local-service-status[data-state="waiting-install"]::before,
 .local-service-status[data-state="unavailable"]::before {
   background: #d05a51;
+}
+
+.onboarding-card {
+  margin-top: -8px;
+  border-color: #cfe0ff;
+  background: linear-gradient(145deg, #fff, #f4f8ff);
+}
+
+.onboarding-card h2 {
+  margin: 2px 0 6px;
+  font-size: 17px;
+}
+
+.onboarding-card p:not(.eyebrow):not(.action-feedback) {
+  margin: 0;
+  color: var(--muted);
+  font-size: 13px;
+}
+
+.onboarding-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 14px;
+}
+
+.onboarding-card .action-feedback {
+  min-height: 18px;
+  margin: 10px 0 0;
 }
 
 .mode-tabs {

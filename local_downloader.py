@@ -18,6 +18,7 @@ from urllib.request import HTTPRedirectHandler, Request, build_opener
 
 HOST = "127.0.0.1"
 PORT = int(os.environ.get("MEETING_PARSER_PORT", "8765"))
+COMPANION_VERSION = "0.5.0"
 CHUNK_SIZE = 1024 * 1024
 MAX_JSON_BYTES = 256 * 1024
 MAX_HEADER_VALUE_LENGTH = 8192
@@ -403,7 +404,7 @@ class DownloaderHandler(BaseHTTPRequestHandler):
         note_activity()
         parsed = urlsplit(self.path)
         if parsed.path == "/health":
-            self.send_json(HTTPStatus.OK, {"ok": True, "service": "local-downloader"})
+            self.send_json(HTTPStatus.OK, {"ok": True, "service": "local-downloader", "version": COMPANION_VERSION})
             return
         if parsed.path == "/status":
             task_id = parse_qs(parsed.query).get("id", [""])[0]

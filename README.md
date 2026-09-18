@@ -6,33 +6,37 @@
 
 首次使用只需完成一次本地组件安装。安装完成后，日常使用不需要打开 PowerShell、Python 或任何本地服务窗口：
 
-1. 在 Chrome 或 Edge 的扩展管理页开启“开发者模式”，加载仓库中的 `extension/` 目录。
-2. 完成一次本地组件安装；安装程序会放置下载组件并注册浏览器所需的连接。
-3. 正常登录并打开腾讯会议录制页面，播放视频。
-4. 打开插件，确认顶部显示“本地下载服务已就绪”，然后点击“下载 MP4”或“开始批量下载”。
+1. 安装并启用扩展，在 Chrome 或 Edge 中打开腾讯会议录制页面。
+2. 首次打开插件时，点击“安装本地组件”；浏览器会下载 `MeetingParserSetup.exe`。
+3. 双击运行安装程序，完成一次安装；插件会自动检测并显示“环境已准备好”。
+4. 正常登录并打开腾讯会议录制页面，播放视频，然后点击“下载 MP4”或“开始批量下载”。
 
 插件会在需要时静默启动本地下载组件；组件空闲一段时间后会自行退出，下次下载会再次启动。批量下载运行时仅阻止系统因空闲进入睡眠，不会保持屏幕常亮。
 
-## 一次性安装（当前开发版）
+## 开发者运行方式
 
-当前仓库提供的是开发版安装路径。先由开发者构建出本地组件，再运行一次安装脚本；两者都无需管理员权限：
+开发者构建发布安装程序需要先安装 Inno Setup 6：
+
+```powershell
+.\scripts\build_setup.ps1
+```
+
+输出文件为 `dist/release/MeetingParserSetup.exe`。安装程序会把组件放入 `%LOCALAPPDATA%\MeetingParser\`，并注册 Chrome 与 Edge 的当前用户 Native Messaging 项。
+
+如需单独构建 Companion：
 
 ```powershell
 .\scripts\build_companion.ps1
-.\installer\install_companion.ps1
 ```
 
-组件会安装到 `%LOCALAPPDATA%\MeetingParser\`，并注册 Chrome 与 Edge 的当前用户 Native Messaging 项。扩展已内置稳定 ID，安装脚本会自动写入正确的访问配置，不需要手工复制扩展 ID。
-
-卸载本地组件：
+开发调试安装/卸载仍可使用 PowerShell 脚本：
 
 ```powershell
+.\installer\install_companion.ps1
 .\installer\uninstall_companion.ps1
 ```
 
-构建生成的 `dist/` 与 `.build/` 不提交 Git。
-
-## 开发者运行方式
+这些脚本仅供开发者使用，普通用户不需要运行。
 
 开发调试可直接运行 Python 下载器：
 

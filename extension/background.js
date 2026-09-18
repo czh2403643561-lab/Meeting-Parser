@@ -22,6 +22,8 @@ const BATCH_STATE_KEY = "batchState";
 const BATCH_LOG_KEY = "batchEventLog";
 const BATCH_SESSION_KEY = "batchBrowserSessionActive";
 const NATIVE_HOST_NAME = "com.meetingparser.helper";
+const RELEASE_SETUP_URL = "https://github.com/czh2403643561-lab/Meeting-Parser/releases/latest/download/MeetingParserSetup.exe";
+const MIN_COMPANION_VERSION = "0.5.0";
 const LOCAL_DOWNLOADER_BASE = "http://127.0.0.1:8765";
 const MAX_BATCH_LOGS = 300;
 const BATCH_ALARM_NAME = "batchDownloadTick";
@@ -579,10 +581,25 @@ function setLocalDownloaderState(state) {
 async function checkLocalDownloaderHealth() {
   try {
     const result = await localDownloaderRequest("/health");
-    return { ok: result.ok === true };
+    const version = typeof result.version === "string" ? result.version : "";
+    const compatible = result.ok === true && versionAtLeast(version, MIN_COMPANION_VERSION);
+    return { ok: compatible, version, needsUpdate: result.ok === true && !compatible };
   } catch (error) {
     return { ok: false, error: error.message };
   }
+}
+
+function versionAtLeast(actual, required) {
+  const parse = (value) => String(value || "").split(".").map((part) => Number.parseInt(part, 10));
+  const actualParts = parse(actual);
+  const requiredParts = parse(required);
+  if (actualParts.some((part) => !Number.isInteger(part)) || requiredParts.some((part) => !Number.isInteger(part))) return false;
+  for (let index = 0; index < requiredParts.length; index += 1) {
+    const left = actualParts[index] || 0;
+    const right = requiredParts[index] || 0;
+    if (left !== right) return left > right;
+  }
+  return true;
 }
 
 function sendNativeMessage(message) {
@@ -604,6 +621,10 @@ async function ensureLocalDownloader() {
   if (health.ok) {
     setLocalDownloaderState("ready");
     return { ok: true, state: "ready" };
+  }
+  if (health.needsUpdate) {
+    setLocalDownloaderState("update-required");
+    throw new Error("本地组件需要更新，请下载安装程序。");
   }
   if (localDownloaderStarting) return localDownloaderStarting;
 
@@ -632,6 +653,10 @@ async function ensureLocalDownloader() {
       if (retry.ok) {
         setLocalDownloaderState("ready");
         return { ok: true, state: "ready" };
+      }
+      if (retry.needsUpdate) {
+        setLocalDownloaderState("update-required");
+        throw new Error("本地组件需要更新，请下载安装程序。");
       }
       await waitFor(250);
     }
@@ -1416,6 +1441,15 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       .then((status) => sendResponse(status))
       .catch((error) => sendResponse({ error: error.message }));
     return true;
+  }
+
+  if (message?.type === "getCompanionSetup") {
+    sendResponse({
+      ok: Boolean(RELEASE_SETUP_URL),
+      url: RELEASE_SETUP_URL,
+      filename: "MeetingParserSetup.exe"
+    });
+    return;
   }
 
   if (message?.type === "getLocalDownloadStatus") {

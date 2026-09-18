@@ -39,6 +39,12 @@ const exportBatchLogsButton = document.querySelector("#export-batch-logs");
 const clearBatchLogsButton = document.querySelector("#clear-batch-logs");
 const batchLogOutput = document.querySelector("#batch-log-output");
 const localServiceStatus = document.querySelector("#local-service-status");
+const companionOnboarding = document.querySelector("#companion-onboarding");
+const installLocalComponentButton = document.querySelector("#install-local-component");
+const recheckLocalComponentButton = document.querySelector("#recheck-local-component");
+const onboardingFeedback = document.querySelector("#onboarding-feedback");
+const onboardingTitle = document.querySelector("#onboarding-title");
+const onboardingDescription = document.querySelector("#onboarding-description");
 
 const labels = {
   mp4: "MP4",
@@ -59,6 +65,11 @@ let pendingFilename = "";
 let batchState = null;
 let batchDraft = { items: [], duplicateCount: 0, invalidCount: 0 };
 let batchMonitorTimer = null;
+let localComponentState = "checking";
+let setupPollTimer = null;
+let setupPollDeadline = 0;
+let setupDownloadInProgress = false;
+let onboardingNeedsUpdate = false;
 const COLLAPSE_STATE_KEY = "sidePanelCollapseState";
 let collapseState = {};
 
@@ -79,12 +90,39 @@ function renderLocalServiceStatus(state) {
     ready: "本地下载服务已就绪",
     checking: "正在检查本地组件…",
     starting: "正在启动下载服务…",
-    "not-installed": "本地组件尚未安装，请先完成一次安装。",
-    unavailable: "本地组件暂时不可用"
+    "not-installed": "需要安装本地组件",
+    "update-required": "本地组件需要更新",
+    "waiting-install": "正在等待安装完成…",
+    unavailable: "本地组件启动失败"
   };
   const normalized = messages[state] ? state : "unavailable";
+  localComponentState = normalized;
   localServiceStatus.dataset.state = normalized;
   localServiceStatus.textContent = messages[normalized];
+  if (normalized === "not-installed") onboardingNeedsUpdate = false;
+  if (normalized === "update-required") onboardingNeedsUpdate = true;
+  const onboardingVisible = ["not-installed", "update-required", "waiting-install"].includes(normalized);
+  companionOnboarding.hidden = !onboardingVisible;
+  onboardingTitle.textContent = onboardingNeedsUpdate ? "本地组件需要更新" : "首次使用准备";
+  onboardingDescription.textContent = onboardingNeedsUpdate
+    ? "当前本地组件版本较旧，需要更新一次，之后会自动启动。"
+    : "需要安装一个本地下载组件来保存视频。只需安装一次，之后会自动启动。";
+  if (["not-installed", "update-required"].includes(normalized) && !setupPollTimer && !setupDownloadInProgress) {
+    installLocalComponentButton.hidden = false;
+    installLocalComponentButton.disabled = false;
+    installLocalComponentButton.textContent = onboardingNeedsUpdate ? "更新本地组件" : "安装本地组件";
+    recheckLocalComponentButton.hidden = true;
+    onboardingFeedback.textContent = "";
+  }
+  updateDownloadControls();
+}
+
+function updateDownloadControls() {
+  const ready = localComponentState === "ready";
+  document.querySelectorAll(".download-candidate").forEach((button) => {
+    button.disabled = !ready;
+  });
+  if (!startBatchButton.dataset.busy) startBatchButton.disabled = !ready;
 }
 
 async function refreshLocalServiceStatus() {
@@ -97,6 +135,102 @@ async function refreshLocalServiceStatus() {
     renderLocalServiceStatus("unavailable");
     return { ok: false, state: "unavailable" };
   }
+}
+
+function stopSetupPolling() {
+  if (setupPollTimer) clearTimeout(setupPollTimer);
+  setupPollTimer = null;
+  setupPollDeadline = 0;
+}
+
+function downloadSetupFile(info) {
+  return new Promise((resolve, reject) => {
+    if (!chrome.downloads?.download || !info?.url) {
+      reject(new Error("暂未配置安装程序下载地址。"));
+      return;
+    }
+    chrome.downloads.download({
+      url: info.url,
+      filename: info.filename || "MeetingParserSetup.exe",
+      saveAs: false,
+      conflictAction: "uniquify"
+    }, (downloadId) => {
+      const error = chrome.runtime.lastError;
+      if (error) reject(new Error(error.message));
+      else resolve(downloadId);
+    });
+  });
+}
+
+async function pollForCompanionInstallation() {
+  if (Date.now() >= setupPollDeadline) {
+    stopSetupPolling();
+    setupDownloadInProgress = false;
+    renderLocalServiceStatus(onboardingNeedsUpdate ? "update-required" : "not-installed");
+    installLocalComponentButton.hidden = false;
+    installLocalComponentButton.disabled = false;
+    installLocalComponentButton.textContent = "重新下载安装程序";
+    recheckLocalComponentButton.hidden = false;
+    onboardingFeedback.textContent = "暂未检测到安装完成，可重新检测或重新下载安装程序。";
+    return;
+  }
+
+  const result = await refreshLocalServiceStatus();
+  if (result?.ok) {
+    stopSetupPolling();
+    setupDownloadInProgress = false;
+    companionOnboarding.hidden = false;
+    onboardingTitle.textContent = "环境已准备好";
+    onboardingDescription.textContent = "本地下载组件已安装完成，之后会自动启动。";
+    installLocalComponentButton.hidden = true;
+    recheckLocalComponentButton.hidden = true;
+    onboardingFeedback.textContent = "环境已准备好。";
+    setTimeout(() => {
+      if (localComponentState === "ready") companionOnboarding.hidden = true;
+    }, 4000);
+    return;
+  }
+
+  setupDownloadInProgress = true;
+  renderLocalServiceStatus("waiting-install");
+  installLocalComponentButton.disabled = true;
+  installLocalComponentButton.textContent = "安装程序已下载";
+  recheckLocalComponentButton.hidden = true;
+  onboardingFeedback.textContent = "安装程序已下载，请运行 MeetingParserSetup.exe。";
+  setupPollTimer = setTimeout(() => void pollForCompanionInstallation(), 2500);
+}
+
+async function beginCompanionInstallation({ redownload = false } = {}) {
+  if (setupDownloadInProgress && !redownload) return;
+  stopSetupPolling();
+  setupDownloadInProgress = true;
+  installLocalComponentButton.disabled = true;
+  installLocalComponentButton.textContent = "正在下载安装程序…";
+  recheckLocalComponentButton.hidden = true;
+  onboardingFeedback.textContent = "正在准备安装程序…";
+  try {
+    const info = await chrome.runtime.sendMessage({ type: "getCompanionSetup" });
+    if (info?.error || !info?.ok) throw new Error(info?.error || "暂未配置安装程序下载地址。");
+    await downloadSetupFile(info);
+    setupPollDeadline = Date.now() + 5 * 60 * 1000;
+    onboardingFeedback.textContent = "安装程序已下载，请运行 MeetingParserSetup.exe。";
+    await pollForCompanionInstallation();
+  } catch (error) {
+    setupDownloadInProgress = false;
+    installLocalComponentButton.disabled = false;
+    installLocalComponentButton.textContent = "重新下载安装程序";
+    recheckLocalComponentButton.hidden = false;
+    onboardingFeedback.textContent = `安装程序下载失败：${error.message || "未知错误"}`;
+  }
+}
+
+async function recheckCompanionInstallation() {
+  stopSetupPolling();
+  setupDownloadInProgress = true;
+  setupPollDeadline = Date.now() + 5 * 60 * 1000;
+  recheckLocalComponentButton.hidden = true;
+  onboardingFeedback.textContent = "正在等待安装完成…";
+  await pollForCompanionInstallation();
 }
 
 async function restoreCollapseState() {
@@ -494,7 +628,9 @@ function createCandidateCard(candidate, page, tabId) {
 
   if (candidate.kind === "mp4") {
     const download = document.createElement("button");
+    download.className = "download-candidate";
     download.type = "button";
+    download.disabled = localComponentState !== "ready";
     download.textContent = "下载 MP4";
     download.addEventListener("click", async () => {
       download.disabled = true;
@@ -696,6 +832,12 @@ parseBatchButton.addEventListener("click", async () => {
 });
 
 startBatchButton.addEventListener("click", async () => {
+  if (localComponentState !== "ready") {
+    showBatchFeedback("请先安装或更新本地组件。");
+    companionOnboarding.hidden = false;
+    return;
+  }
+  startBatchButton.dataset.busy = "true";
   startBatchButton.disabled = true;
   batchProgress.hidden = false;
   batchStatus.textContent = "正在启动批量任务…";
@@ -717,7 +859,8 @@ startBatchButton.addEventListener("click", async () => {
     await refreshBatchLogs();
     await refreshLocalServiceStatus();
   } finally {
-    startBatchButton.disabled = false;
+    delete startBatchButton.dataset.busy;
+    updateDownloadControls();
   }
 });
 
@@ -837,6 +980,8 @@ chrome.runtime.onMessage.addListener((message) => {
 });
 
 refreshButton.addEventListener("click", refresh);
+installLocalComponentButton.addEventListener("click", () => void beginCompanionInstallation());
+recheckLocalComponentButton.addEventListener("click", () => void recheckCompanionInstallation());
 void restoreCollapseState().then(() => {
   const logsVisible = collapseState["batch-logs"] === true;
   batchLogOutput.hidden = !logsVisible;
@@ -852,5 +997,6 @@ void restoreCollapseState().then(() => {
     }
     void refreshLocalServiceStatus();
     void refresh();
+    updateDownloadControls();
   });
 });

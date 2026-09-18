@@ -34,6 +34,9 @@
 - 已增加标题提取、非法字符、长标题和 Python 文件名处理的定向测试
 - 已修复 PowerShell 5.1 脚本编码兼容：全部 `.ps1` 统一为 UTF-8 BOM + CRLF，并增加 `.editorconfig`
 - 已验证 Windows PowerShell 5.1 / PowerShell 7 的 Companion 构建、安装和卸载模拟流程
+- 已新增 Inno Setup 安装包配置与 `scripts/build_setup.ps1`，可生成 `dist/release/MeetingParserSetup.exe`
+- 已在临时用户目录真实验证 Setup 安装文件、Native Messaging manifest、Chrome/Edge HKCU 注册和卸载清理
+- Companion `/health` 已增加版本信息，Side Panel 可提示旧组件更新并复用下载安装流程
 
 ## 当前
 
@@ -42,6 +45,7 @@
 - Companion 与浏览器 Native Messaging 的完整真实端到端流程尚待在重新加载的 Chrome/Edge 扩展中验证，不能视为“一键体验已真实完成”
 - 本轮文件命名已完成代码级整理，真实腾讯会议页面的最终文件名仍需现场回归确认
 - Companion PowerShell 脚本已具备 Windows PowerShell 5.1 编码兼容性
+- Side Panel 已加入首次使用安装引导、Setup 下载和最长 5 分钟自动检测
 
 ## 问题
 
@@ -51,6 +55,7 @@
 - 需验证杀掉 Companion 后插件可自动再次拉起，以及批量暂停/完成时能释放防休眠
 - Chrome/Edge 现在应加载 `extension/` 目录，不应加载仓库根目录
 - 需确认真实页面顶部标题 DOM 在不同腾讯会议页面变体上的提取结果
+- 尚未在未安装组件的真实 Chrome/Edge Side Panel 中完成首次安装按钮、下载后自动检测和正常下载的完整回归
 
 ## 下一步
 
@@ -60,3 +65,4 @@
 - 完成后再运行完整 67 条列表
 - 在真实腾讯会议页面验证单条与批量标题命名、中文标点、长标题和重名冲突处理
 - 继续完成真实 Chrome/Edge Companion、批量恢复和下载命名回归
+- 发布或配置 GitHub Release 安装包后，在干净浏览器环境验证首次安装流程；未完成前不宣称普通用户一键安装已真实完成

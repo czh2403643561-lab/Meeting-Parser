@@ -19,6 +19,17 @@
         <span id="local-service-status" class="brand-status local-service-status" data-state="checking">正在检查本地组件…</span>
       </header>
 
+      <section id="companion-onboarding" class="panel onboarding-card" hidden>
+        <p class="eyebrow">开始使用</p>
+        <h2 id="onboarding-title">首次使用准备</h2>
+        <p id="onboarding-description">需要安装一个本地下载组件来保存视频。只需安装一次，之后会自动启动。</p>
+        <div class="onboarding-actions">
+          <button id="install-local-component" type="button">安装本地组件</button>
+          <button id="recheck-local-component" class="secondary-button" type="button" hidden>重新检测</button>
+        </div>
+        <p id="onboarding-feedback" class="action-feedback" role="status" aria-live="polite"></p>
+      </section>
+
       <nav class="mode-tabs" aria-label="下载模式" role="tablist">
         <button id="single-tab" class="mode-tab active" type="button" role="tab" aria-selected="true">
           <span class="tab-icon">◉</span> 单个下载
