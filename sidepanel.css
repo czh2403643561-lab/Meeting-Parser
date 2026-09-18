@@ -127,6 +127,49 @@ textarea {
   font-size: 12px;
 }
 
+.preference-label {
+  display: block;
+  margin-top: 10px;
+  color: #475467;
+  font-size: 12px;
+}
+
+select {
+  margin-left: 6px;
+  padding: 5px;
+  border: 1px solid #d0d5dd;
+  border-radius: 5px;
+  color: #172033;
+  background: #fff;
+}
+
+.batch-progress {
+  margin-top: 10px;
+  padding: 10px;
+  border: 1px solid #b8cdfa;
+  border-radius: 8px;
+  background: #fff;
+}
+
+.batch-progress p {
+  margin-top: 5px;
+  color: #667085;
+  font-size: 12px;
+}
+
+#batch-file-progress {
+  display: block;
+  width: 100%;
+  height: 10px;
+  margin-top: 8px;
+  accent-color: #276ef1;
+}
+
+.batch-actions {
+  display: flex;
+  gap: 8px;
+}
+
 .batch-list {
   margin: 8px 0 12px;
   padding-left: 24px;
@@ -142,6 +185,12 @@ textarea {
 .batch-list small {
   display: block;
   color: #667085;
+}
+
+.retry-batch {
+  margin-top: 4px;
+  padding: 3px 6px;
+  font-size: 11px;
 }
 
 .disabled-action {

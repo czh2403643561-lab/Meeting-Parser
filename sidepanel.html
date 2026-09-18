@@ -38,16 +38,33 @@
 
       <section id="batch-view" hidden>
         <h1>批量下载</h1>
-        <p class="batch-note">本阶段只解析链接，不会自动打开页面或下载。</p>
+        <p class="batch-note">严格按顺序下载；工作标签页关闭后可继续任务。</p>
         <label class="file-picker">
           <span>导入 TXT</span>
           <input id="batch-file" type="file" accept=".txt,text/plain" />
         </label>
         <textarea id="batch-links" rows="8" placeholder="也可以直接粘贴腾讯会议链接，每行一个"></textarea>
         <button id="parse-batch" type="button">解析链接</button>
+        <label class="preference-label">优先下载
+          <select id="media-preference">
+            <option value="auto">自动（普通录制优先）</option>
+            <option value="screen">屏幕画面</option>
+            <option value="speaker">发言人画面</option>
+          </select>
+        </label>
         <p id="batch-summary" class="batch-summary">尚未解析</p>
+        <section id="batch-progress" class="batch-progress" hidden>
+          <strong id="batch-current"></strong>
+          <p id="batch-status" role="status"></p>
+          <progress id="batch-file-progress" max="100" value="0" hidden></progress>
+          <p id="batch-size"></p>
+        </section>
         <ol id="batch-list" class="batch-list"></ol>
-        <button id="start-batch" class="disabled-action" type="button" disabled>开始批量下载（下一阶段启用）</button>
+        <div class="batch-actions">
+          <button id="start-batch" type="button">开始批量下载</button>
+          <button id="pause-batch" class="secondary-button" type="button" hidden>暂停</button>
+          <button id="resume-batch" type="button" hidden>继续</button>
+        </div>
       </section>
     </main>
     <script src="sidepanel.js"></script>

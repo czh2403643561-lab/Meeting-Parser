@@ -16,8 +16,15 @@ const batchLinks = document.querySelector("#batch-links");
 const parseBatchButton = document.querySelector("#parse-batch");
 const batchSummary = document.querySelector("#batch-summary");
 const batchList = document.querySelector("#batch-list");
-
-const BATCH_TASKS_KEY = "batchMeetingTasks";
+const mediaPreference = document.querySelector("#media-preference");
+const batchProgress = document.querySelector("#batch-progress");
+const batchCurrent = document.querySelector("#batch-current");
+const batchStatus = document.querySelector("#batch-status");
+const batchFileProgress = document.querySelector("#batch-file-progress");
+const batchSize = document.querySelector("#batch-size");
+const startBatchButton = document.querySelector("#start-batch");
+const pauseBatchButton = document.querySelector("#pause-batch");
+const resumeBatchButton = document.querySelector("#resume-batch");
 
 const labels = {
   mp4: "MP4",
@@ -35,6 +42,8 @@ let activeDownload = null;
 let monitorTimer = null;
 let monitorToken = 0;
 let pendingFilename = "";
+let batchState = null;
+let batchMonitorTimer = null;
 
 function activeTab() {
   return chrome.tabs.query({ active: true, lastFocusedWindow: true }).then(([tab]) => tab);
@@ -106,43 +115,112 @@ function parseBatchLinks(text) {
   return { items, duplicateCount, invalidCount };
 }
 
+const batchStatusLabels = {
+  pending: "待处理",
+  navigating: "正在打开页面",
+  detecting: "正在发现 MP4",
+  preparing: "正在准备下载上下文",
+  downloading: "下载中",
+  complete: "已完成",
+  failed: "失败"
+};
+
 function renderBatchItems(items) {
   batchList.replaceChildren();
   for (const item of items) {
     const row = document.createElement("li");
-    row.textContent = truncateUrl(item.url);
-    row.title = item.url;
+    const title = item.pageTitle || item.pageUrl || item.url;
+    row.textContent = truncateUrl(title);
+    row.title = item.pageUrl || item.url || title;
     const state = document.createElement("small");
-    state.textContent = item.status || "待处理";
+    const progress = item.status === "downloading" && Number.isFinite(item.progress) ? ` · ${item.progress.toFixed(1)}%` : "";
+    const error = item.status === "failed" && item.error ? `：${item.error}` : "";
+    state.textContent = `${batchStatusLabels[item.status] || item.status || "待处理"}${progress}${error}`;
     row.append(state);
+    if (item.status === "failed") {
+      const retry = document.createElement("button");
+      retry.type = "button";
+      retry.className = "secondary-button retry-batch";
+      retry.textContent = "重试";
+      retry.addEventListener("click", async () => {
+        const result = await chrome.runtime.sendMessage({ type: "retryBatchTask", index: item.index });
+        if (result?.error) {
+          batchSummary.textContent = result.error;
+          return;
+        }
+        renderBatchState(result);
+      });
+      row.append(retry);
+    }
     batchList.append(row);
   }
 }
 
-function renderBatchSummary(result) {
-  batchSummary.textContent = `已识别 ${result.items.length} 条 · 重复 ${result.duplicateCount} 条 · 无效 ${result.invalidCount} 条`;
-  renderBatchItems(result.items);
+function batchCounts(state) {
+  return state.tasks.reduce(
+    (counts, task) => {
+      counts.total += 1;
+      counts[task.status] = (counts[task.status] || 0) + 1;
+      return counts;
+    },
+    { total: 0 }
+  );
 }
 
-async function saveBatchResult(result) {
-  await chrome.storage.session.set({
-    [BATCH_TASKS_KEY]: {
-      items: result.items,
-      duplicateCount: result.duplicateCount,
-      invalidCount: result.invalidCount
+function renderBatchState(state) {
+  batchState = state;
+  const tasks = state?.tasks || [];
+  const counts = batchCounts({ tasks });
+  const waiting = (counts.pending || 0) + (counts.navigating || 0) + (counts.detecting || 0) + (counts.preparing || 0) + (counts.downloading || 0);
+  const current = tasks[state?.currentIndex] || null;
+  batchSummary.textContent = `总数 ${counts.total} · 完成 ${counts.complete || 0} · 失败 ${counts.failed || 0} · 待处理 ${waiting}`;
+  renderBatchItems(tasks);
+
+  batchProgress.hidden = !current;
+  if (current) {
+    batchCurrent.textContent = `当前第 ${current.index + 1} / ${counts.total}`;
+    batchStatus.textContent = `${batchStatusLabels[current.status] || current.status}${current.filename ? `：${current.filename}` : current.pageTitle ? `：${current.pageTitle}` : ""}`;
+    const totalBytes = Number.isFinite(current.totalBytes) ? current.totalBytes : null;
+    if (totalBytes !== null && current.status === "downloading") {
+      const progress = Number.isFinite(current.progress) ? current.progress : 0;
+      batchFileProgress.hidden = false;
+      batchFileProgress.value = progress;
+      batchSize.textContent = `${formatBytes(Number(current.bytes) || 0)} / ${formatBytes(totalBytes)} · ${progress.toFixed(1)}%`;
+    } else {
+      batchFileProgress.hidden = true;
+      batchSize.textContent = current.status === "downloading" ? `已下载 ${formatBytes(Number(current.bytes) || 0)}` : "";
     }
-  });
+  }
+
+  mediaPreference.value = ["auto", "screen", "speaker"].includes(state?.mediaPreference) ? state.mediaPreference : "auto";
+  startBatchButton.hidden = state?.status === "running";
+  pauseBatchButton.hidden = state?.status !== "running";
+  resumeBatchButton.hidden = state?.status !== "paused";
+  startBatchButton.textContent = state?.status === "completed" ? "重新开始批量下载" : "开始批量下载";
+  if (state?.status === "paused" && !current?.taskId) {
+    batchStatus.textContent = "批量已暂停。";
+  }
 }
 
-async function restoreBatchResult() {
-  const result = await chrome.storage.session.get(BATCH_TASKS_KEY);
-  const saved = result[BATCH_TASKS_KEY];
-  if (!saved || !Array.isArray(saved.items)) return;
-  renderBatchSummary({
-    items: saved.items,
-    duplicateCount: Number(saved.duplicateCount) || 0,
-    invalidCount: Number(saved.invalidCount) || 0
-  });
+function stopBatchMonitoring() {
+  if (batchMonitorTimer) clearTimeout(batchMonitorTimer);
+  batchMonitorTimer = null;
+}
+
+function monitorBatchState() {
+  stopBatchMonitoring();
+  const poll = async () => {
+    try {
+      const state = await chrome.runtime.sendMessage({ type: "getBatchState" });
+      if (!state?.error) renderBatchState(state);
+      if (state?.status === "running" || state?.tasks?.[state.currentIndex]?.status === "downloading") {
+        batchMonitorTimer = setTimeout(poll, 800);
+      }
+    } catch {
+      batchMonitorTimer = setTimeout(poll, 1000);
+    }
+  };
+  void poll();
 }
 
 function formatBytes(value) {
@@ -422,8 +500,38 @@ batchFile.addEventListener("change", async () => {
 
 parseBatchButton.addEventListener("click", async () => {
   const result = parseBatchLinks(batchLinks.value);
-  renderBatchSummary(result);
-  await saveBatchResult(result);
+  const state = await chrome.runtime.sendMessage({ type: "setBatchTasks", items: result.items });
+  if (state?.error) {
+    batchSummary.textContent = state.error;
+    return;
+  }
+  renderBatchState(state);
+  batchSummary.textContent = `已识别 ${result.items.length} 条 · 重复 ${result.duplicateCount} 条 · 无效 ${result.invalidCount} 条`;
+});
+
+startBatchButton.addEventListener("click", async () => {
+  const state = await chrome.runtime.sendMessage({ type: "startBatch", mediaPreference: mediaPreference.value });
+  if (state?.error) {
+    batchSummary.textContent = state.error;
+    return;
+  }
+  renderBatchState(state);
+  monitorBatchState();
+});
+
+pauseBatchButton.addEventListener("click", async () => {
+  const state = await chrome.runtime.sendMessage({ type: "pauseBatch" });
+  if (!state?.error) renderBatchState(state);
+});
+
+resumeBatchButton.addEventListener("click", async () => {
+  const state = await chrome.runtime.sendMessage({ type: "startBatch", mediaPreference: mediaPreference.value });
+  if (state?.error) {
+    batchSummary.textContent = state.error;
+    return;
+  }
+  renderBatchState(state);
+  monitorBatchState();
 });
 
 chrome.runtime.onMessage.addListener((message) => {
@@ -439,8 +547,18 @@ chrome.runtime.onMessage.addListener((message) => {
       if (tab?.id === message.tabId) void refresh();
     });
   }
+  if (message?.type === "batchStateChanged") {
+    void chrome.runtime.sendMessage({ type: "getBatchState" }).then((state) => {
+      if (!state?.error) renderBatchState(state);
+    });
+  }
 });
 
 refreshButton.addEventListener("click", refresh);
-void restoreBatchResult();
+void chrome.runtime.sendMessage({ type: "getBatchState" }).then((state) => {
+  if (!state?.error) {
+    renderBatchState(state);
+    if (state.status === "running" || state.tasks?.[state.currentIndex]?.status === "downloading") monitorBatchState();
+  }
+});
 void refresh();
