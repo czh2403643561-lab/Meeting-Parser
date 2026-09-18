@@ -28,6 +28,108 @@ function isTencentRecordingPage() {
     && /^\/(?:crm|cw)\//i.test(location.pathname);
 }
 
+const TRANSCRIPT_EXCLUDED_TAGS = new Set([
+  "BUTTON", "INPUT", "TEXTAREA", "SELECT", "OPTION", "SCRIPT", "STYLE", "NOSCRIPT", "SVG"
+]);
+
+function visibleTranscriptElement(element) {
+  if (!element || TRANSCRIPT_EXCLUDED_TAGS.has(element.tagName)) return false;
+  if (element.hidden || element.getAttribute("aria-hidden") === "true") return false;
+  const style = typeof getComputedStyle === "function" ? getComputedStyle(element) : null;
+  return !style || (style.display !== "none" && style.visibility !== "hidden");
+}
+
+function transcriptElementLooksLikeUi(element) {
+  const semantic = [
+    element.tagName,
+    element.id,
+    element.className,
+    element.getAttribute?.("role"),
+    element.getAttribute?.("aria-label")
+  ].filter((value) => typeof value === "string").join(" ");
+  return /(?:button|navigation|nav|toolbar|pagination|timeline|share|search|menu|breadcrumb|tablist)/iu.test(semantic)
+    || ["button", "navigation", "menu", "tab", "tablist"].includes(element.getAttribute?.("role"));
+}
+
+function chineseCharacterCount(value) {
+  return (String(value || "").match(/[\u3400-\u9fff]/g) || []).length;
+}
+
+function transcriptLineLooksLikeUi(line) {
+  const value = String(line || "").trim();
+  if (!value || value.length < 4) return true;
+  if (/^(?:逐字稿|纪要|时间轴|分享|搜索|请输入关键词|总结会议重点|分发言人观点)$/u.test(value)) return true;
+  if (/^(?:\d{1,2}:)?\d{1,2}:\d{2}(?:\s*[\u4e00-\u9fff\w-]{0,20})?$/u.test(value)) return true;
+  if (value.length <= 20 && !/[，。！？；：,.!?;:]/u.test(value)) return true;
+  return false;
+}
+
+function normalizeTranscriptText(value) {
+  return String(value || "")
+    .split(/\n+/)
+    .map((line) => line.replace(/\s+/g, " ").trim())
+    .filter((line) => !transcriptLineLooksLikeUi(line) && chineseCharacterCount(line) >= 4)
+    .join("\n");
+}
+
+function transcriptCandidate(element) {
+  if (!visibleTranscriptElement(element) || transcriptElementLooksLikeUi(element)) return null;
+  const rawText = element.innerText || element.textContent || "";
+  const text = normalizeTranscriptText(rawText);
+  const chineseCount = chineseCharacterCount(text);
+  if (text.length < 80 || chineseCount < 20 || chineseCount / Math.max(text.length, 1) < 0.22) return null;
+  const labelBonus = /逐字稿/iu.test(rawText) ? 900 : 0;
+  const sizeBonus = Math.min(text.length, 12000) / 20;
+  return { element, text, score: labelBonus + sizeBonus + chineseCount };
+}
+
+function detectTranscript() {
+  const candidates = [];
+  const labelElements = [...document.querySelectorAll("body *")]
+    .filter((element) => /逐字稿/iu.test(element.textContent || "") && (element.textContent || "").length < 120);
+  for (const label of labelElements) {
+    let current = label;
+    for (let depth = 0; current && depth < 6; depth += 1, current = current.parentElement) {
+      const candidate = transcriptCandidate(current);
+      if (candidate) candidates.push(candidate);
+    }
+  }
+
+  for (const element of document.querySelectorAll("main, section, article, div")) {
+    const candidate = transcriptCandidate(element);
+    if (candidate) candidates.push(candidate);
+  }
+
+  const best = candidates.sort((left, right) => right.score - left.score)[0];
+  if (!best) {
+    console.info("[diagnostic] transcriptFound", false);
+    console.info("[diagnostic] textLength", 0);
+    return { transcriptFound: false };
+  }
+
+  const lines = best.text.split("\n").filter(Boolean);
+  const result = {
+    transcriptFound: true,
+    blockCount: lines.length,
+    textLength: best.text.length,
+    preview: best.text.slice(0, 500)
+  };
+  console.info("[diagnostic] transcriptFound", true);
+  console.info("[diagnostic] textLength", result.textLength);
+  return result;
+}
+
+function runPageDiagnostic() {
+  const result = {
+    pageUrl: location.href,
+    pageTitle: document.title,
+    pageDetected: isTencentRecordingPage(),
+    videoCount: document.querySelectorAll("video").length
+  };
+  console.info("[diagnostic] pageDetected", result.pageDetected);
+  return { ...result, ...detectTranscript() };
+}
+
 function visibleTitleElement(element) {
   if (!element || element.hidden || element.getAttribute("aria-hidden") === "true") return false;
   const style = typeof getComputedStyle === "function" ? getComputedStyle(element) : null;
@@ -185,6 +287,9 @@ new MutationObserver(scheduleMetadata).observe(document.documentElement, {
 chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
   if (message?.type === "scanPageMedia") {
     sendMetadata();
+  }
+  if (message?.type === "runPageDiagnostic") {
+    sendResponse(runPageDiagnostic());
   }
   if (message?.type === "prepareMediaContext") {
     prepareMediaContext(message.mediaPathname, message.timeoutMs)

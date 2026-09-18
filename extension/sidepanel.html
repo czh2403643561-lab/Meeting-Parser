@@ -51,6 +51,22 @@
 
         <p id="status" class="inline-status" role="status"></p>
 
+        <details id="page-diagnostic" class="panel diagnostic-panel">
+          <summary>页面诊断</summary>
+          <div class="diagnostic-content">
+            <button id="run-page-diagnostic" type="button">开始检测</button>
+            <p id="diagnostic-feedback" class="action-feedback" role="status" aria-live="polite"></p>
+            <dl id="diagnostic-results" class="diagnostic-results" hidden>
+              <div><dt>页面</dt><dd id="diagnostic-page"></dd></div>
+              <div><dt>视频</dt><dd id="diagnostic-video"></dd></div>
+              <div><dt>逐字稿</dt><dd id="diagnostic-transcript"></dd></div>
+              <div><dt>文本数量</dt><dd id="diagnostic-block-count"></dd></div>
+              <div><dt>字符数量</dt><dd id="diagnostic-text-length"></dd></div>
+              <div class="diagnostic-preview-row"><dt>预览</dt><dd id="diagnostic-preview"></dd></div>
+            </dl>
+          </div>
+        </details>
+
         <section id="download-area" class="panel download-area" hidden>
           <div class="section-head">
             <div>

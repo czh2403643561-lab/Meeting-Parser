@@ -431,6 +431,54 @@ code {
   overflow-wrap: anywhere;
 }
 
+.diagnostic-panel {
+  padding: 13px 16px;
+}
+
+.diagnostic-panel summary {
+  color: #526079;
+  cursor: pointer;
+  font-weight: 650;
+  list-style-position: inside;
+}
+
+.diagnostic-content {
+  padding-top: 12px;
+}
+
+.diagnostic-results {
+  margin: 12px 0 0;
+}
+
+.diagnostic-results > div {
+  display: grid;
+  grid-template-columns: 72px minmax(0, 1fr);
+  gap: 8px;
+  padding: 5px 0;
+  border-top: 1px solid #eef1f6;
+}
+
+.diagnostic-results dt {
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.diagnostic-results dd {
+  min-width: 0;
+  margin: 0;
+  overflow-wrap: anywhere;
+  white-space: pre-wrap;
+}
+
+.diagnostic-preview-row dd {
+  max-height: 180px;
+  overflow: auto;
+  white-space: pre-wrap;
+  color: #344054;
+  font-size: 12px;
+  line-height: 1.65;
+}
+
 .empty {
   color: var(--muted);
   text-align: center;

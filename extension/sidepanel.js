@@ -2,6 +2,16 @@ const candidatesElement = document.querySelector("#candidates");
 const statusElement = document.querySelector("#status");
 const pageTitleElement = document.querySelector("#page-title");
 const refreshButton = document.querySelector("#refresh");
+const pageDiagnostic = document.querySelector("#page-diagnostic");
+const runPageDiagnosticButton = document.querySelector("#run-page-diagnostic");
+const diagnosticFeedback = document.querySelector("#diagnostic-feedback");
+const diagnosticResults = document.querySelector("#diagnostic-results");
+const diagnosticPage = document.querySelector("#diagnostic-page");
+const diagnosticVideo = document.querySelector("#diagnostic-video");
+const diagnosticTranscript = document.querySelector("#diagnostic-transcript");
+const diagnosticBlockCount = document.querySelector("#diagnostic-block-count");
+const diagnosticTextLength = document.querySelector("#diagnostic-text-length");
+const diagnosticPreview = document.querySelector("#diagnostic-preview");
 const downloadArea = document.querySelector("#download-area");
 const downloadStatusElement = document.querySelector("#download-status");
 const downloadProgress = document.querySelector("#download-progress");
@@ -784,6 +794,41 @@ async function refresh() {
   }
 }
 
+function renderPageDiagnostic(result, tab) {
+  const transcript = result?.transcriptFound ? result : null;
+  const pageTitle = result?.pageTitle || tab?.title || "未读取";
+  const pageUrl = result?.pageUrl || tab?.url || "";
+  const pageKind = result?.pageDetected ? "是" : "否";
+  diagnosticPage.textContent = `${pageTitle}\n${pageUrl}\n腾讯会议录制页面：${pageKind}`;
+  diagnosticPage.title = result?.pageUrl || tab?.url || "";
+  diagnosticVideo.textContent = `${result?.videoCount ?? 0} 个视频元素`;
+  diagnosticTranscript.textContent = transcript ? "已发现疑似正文" : "未发现疑似正文";
+  diagnosticBlockCount.textContent = transcript ? String(transcript.blockCount ?? 0) : "—";
+  diagnosticTextLength.textContent = transcript ? String(transcript.textLength ?? 0) : "—";
+  diagnosticPreview.textContent = transcript?.preview || "—";
+  diagnosticResults.hidden = false;
+}
+
+async function runPageDiagnostic() {
+  runPageDiagnosticButton.disabled = true;
+  diagnosticResults.hidden = true;
+  diagnosticFeedback.textContent = "正在检测当前页面…";
+  try {
+    const tab = await activeTab();
+    if (!tab?.id) throw new Error("无法读取当前页面。");
+    const result = await chrome.tabs.sendMessage(tab.id, { type: "runPageDiagnostic" });
+    if (!result) throw new Error("当前页面暂不支持诊断。");
+    renderPageDiagnostic(result, tab);
+    diagnosticFeedback.textContent = result.transcriptFound
+      ? "检测完成，已找到逐字稿候选正文。"
+      : "检测完成，暂未找到逐字稿正文。";
+  } catch (error) {
+    diagnosticFeedback.textContent = error.message || "当前页面不可读取。";
+  } finally {
+    runPageDiagnosticButton.disabled = false;
+  }
+}
+
 clearDownloadButton.addEventListener("click", async () => {
   stopMonitoring();
   await chrome.runtime.sendMessage({ type: "clearActiveDownload" });
@@ -1004,12 +1049,14 @@ chrome.runtime.onMessage.addListener((message) => {
 });
 
 refreshButton.addEventListener("click", refresh);
+runPageDiagnosticButton.addEventListener("click", () => void runPageDiagnostic());
 installLocalComponentButton.addEventListener("click", () => void beginCompanionInstallation());
 recheckLocalComponentButton.addEventListener("click", () => void recheckCompanionInstallation());
 void restoreCollapseState().then(() => {
   const logsVisible = collapseState["batch-logs"] === true;
   batchLogOutput.hidden = !logsVisible;
   toggleBatchLogsButton.textContent = logsVisible ? "收起日志" : "查看日志";
+  bindCollapsible(pageDiagnostic, "page-diagnostic");
   return Promise.all([
     chrome.runtime.sendMessage({ type: "getBatchDraft" }),
     chrome.runtime.sendMessage({ type: "getBatchState" })
