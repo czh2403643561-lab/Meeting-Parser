@@ -930,6 +930,36 @@ async function clearActiveDownload() {
   return { ok: true };
 }
 
+async function checkCompanionSetupAvailability() {
+  if (!RELEASE_SETUP_URL) {
+    return { ok: false, state: "not-published" };
+  }
+
+  try {
+    const response = await fetch(RELEASE_SETUP_URL, {
+      method: "HEAD",
+      redirect: "follow",
+      cache: "no-store"
+    });
+    if (response.status === 404) {
+      return { ok: false, state: "not-published" };
+    }
+    if (!response.ok) {
+      return { ok: false, state: "network-unavailable" };
+    }
+    if (response.headers.get("content-length") === "0") {
+      return { ok: false, state: "not-published" };
+    }
+    return {
+      ok: true,
+      url: RELEASE_SETUP_URL,
+      filename: "MeetingParserSetup.exe"
+    };
+  } catch {
+    return { ok: false, state: "network-unavailable" };
+  }
+}
+
 async function beginCompanionUpdate() {
   const activeResult = await chrome.storage.session.get(ACTIVE_DOWNLOAD_KEY);
   const active = activeResult[ACTIVE_DOWNLOAD_KEY];
@@ -1557,13 +1587,18 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     return true;
   }
 
+  if (message?.type === "checkCompanionSetupAvailability") {
+    checkCompanionSetupAvailability()
+      .then((result) => sendResponse(result))
+      .catch(() => sendResponse({ ok: false, state: "network-unavailable" }));
+    return true;
+  }
+
   if (message?.type === "getCompanionSetup") {
-    sendResponse({
-      ok: Boolean(RELEASE_SETUP_URL),
-      url: RELEASE_SETUP_URL,
-      filename: "MeetingParserSetup.exe"
-    });
-    return;
+    checkCompanionSetupAvailability()
+      .then((result) => sendResponse(result))
+      .catch(() => sendResponse({ ok: false, state: "network-unavailable" }));
+    return true;
   }
 
   if (message?.type === "beginCompanionUpdate") {

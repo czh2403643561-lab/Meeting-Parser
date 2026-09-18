@@ -69,9 +69,24 @@ let localComponentState = "checking";
 let setupPollTimer = null;
 let setupPollDeadline = 0;
 let setupDownloadInProgress = false;
+const setupDownloadWaiters = new Map();
 let onboardingNeedsUpdate = false;
 const COLLAPSE_STATE_KEY = "sidePanelCollapseState";
 let collapseState = {};
+
+if (chrome.downloads?.onChanged) {
+  chrome.downloads.onChanged.addListener((delta) => {
+    const waiter = setupDownloadWaiters.get(delta.id);
+    if (!waiter) return;
+    if (delta.state?.current === "complete") {
+      setupDownloadWaiters.delete(delta.id);
+      waiter.resolve();
+    } else if (delta.state?.current === "interrupted") {
+      setupDownloadWaiters.delete(delta.id);
+      waiter.reject(new Error("安装程序下载失败，请重新下载。"));
+    }
+  });
+}
 
 function activeTab() {
   return chrome.tabs.query({ active: true, lastFocusedWindow: true }).then(([tab]) => tab);
@@ -156,8 +171,28 @@ function downloadSetupFile(info) {
       conflictAction: "uniquify"
     }, (downloadId) => {
       const error = chrome.runtime.lastError;
-      if (error) reject(new Error(error.message));
-      else resolve(downloadId);
+      if (error) {
+        reject(new Error("安装程序下载失败，请重新下载。"));
+        return;
+      }
+
+      const finish = (callback) => {
+        setupDownloadWaiters.delete(downloadId);
+        callback();
+      };
+      setupDownloadWaiters.set(downloadId, {
+        resolve: () => finish(resolve),
+        reject: () => finish(() => reject(new Error("安装程序下载失败，请重新下载。")))
+      });
+      chrome.downloads.search({ id: downloadId }, (results) => {
+        if (chrome.runtime.lastError || !results?.[0]) return;
+        const state = results[0].state;
+        if (state === "complete") {
+          setupDownloadWaiters.get(downloadId)?.resolve();
+        } else if (state === "interrupted") {
+          setupDownloadWaiters.get(downloadId)?.reject();
+        }
+      });
     });
   });
 }
@@ -207,12 +242,25 @@ async function beginCompanionInstallation({ redownload = false } = {}) {
   installLocalComponentButton.disabled = true;
   installLocalComponentButton.textContent = "正在下载安装程序…";
   recheckLocalComponentButton.hidden = true;
-  onboardingFeedback.textContent = "正在准备安装程序…";
+  onboardingFeedback.textContent = "正在检查安装程序…";
   try {
+    const info = await chrome.runtime.sendMessage({ type: "checkCompanionSetupAvailability" });
+    if (info?.state === "not-published") {
+      setupDownloadInProgress = false;
+      installLocalComponentButton.disabled = false;
+      installLocalComponentButton.textContent = onboardingNeedsUpdate ? "更新本地组件" : "安装本地组件";
+      onboardingFeedback.textContent = "安装程序暂未发布，请稍后重试。";
+      return;
+    }
+    if (info?.state === "network-unavailable" || !info?.ok) {
+      setupDownloadInProgress = false;
+      installLocalComponentButton.disabled = false;
+      installLocalComponentButton.textContent = onboardingNeedsUpdate ? "更新本地组件" : "安装本地组件";
+      onboardingFeedback.textContent = "无法连接安装程序下载服务，请检查网络后重试。";
+      return;
+    }
     const update = await chrome.runtime.sendMessage({ type: "beginCompanionUpdate" });
     if (update?.error) throw new Error(update.error);
-    const info = await chrome.runtime.sendMessage({ type: "getCompanionSetup" });
-    if (info?.error || !info?.ok) throw new Error(info?.error || "暂未配置安装程序下载地址。");
     await downloadSetupFile(info);
     await chrome.runtime.sendMessage({ type: "armCompanionInstallProbe" });
     setupPollDeadline = Date.now() + 5 * 60 * 1000;
@@ -223,7 +271,7 @@ async function beginCompanionInstallation({ redownload = false } = {}) {
     installLocalComponentButton.disabled = false;
     installLocalComponentButton.textContent = "重新下载安装程序";
     recheckLocalComponentButton.hidden = false;
-    onboardingFeedback.textContent = `安装程序下载失败：${error.message || "未知错误"}`;
+    onboardingFeedback.textContent = error.message || "安装程序下载失败，请重新下载。";
   }
 }
 

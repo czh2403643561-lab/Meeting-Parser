@@ -1,0 +1,68 @@
+name: Build and publish setup
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install Python build dependencies
+        shell: powershell
+        run: python -m pip install -r requirements-dev.txt
+
+      - name: Verify PyInstaller
+        shell: powershell
+        run: python -m PyInstaller --version
+
+      - name: Install Inno Setup 6
+        shell: powershell
+        run: choco install innosetup --no-progress -y
+
+      - name: Build setup executable
+        shell: powershell
+        run: powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\scripts\build_setup.ps1
+
+      - name: Verify setup executable
+        shell: powershell
+        run: |
+          $setupPath = Join-Path $env:GITHUB_WORKSPACE "dist\release\MeetingParserSetup.exe"
+          if (-not (Test-Path -LiteralPath $setupPath -PathType Leaf)) {
+            throw "构建产物不存在：$setupPath"
+          }
+          if ((Get-Item -LiteralPath $setupPath).Length -le 0) {
+            throw "构建产物为空：$setupPath"
+          }
+
+      - name: Upload workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: MeetingParserSetup
+          path: dist/release/MeetingParserSetup.exe
+          if-no-files-found: error
+
+      - name: Create GitHub Release and upload setup
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: powershell
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$env:GITHUB_REF_NAME" `
+            "dist/release/MeetingParserSetup.exe#MeetingParserSetup.exe" `
+            --title "$env:GITHUB_REF_NAME" `
+            --generate-notes
