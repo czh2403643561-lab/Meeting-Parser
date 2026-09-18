@@ -28,6 +28,12 @@ const resumeBatchButton = document.querySelector("#resume-batch");
 const batchTotalProgress = document.querySelector("#batch-total-progress");
 const batchTotalLabel = document.querySelector("#batch-total-label");
 const batchTotalBar = document.querySelector("#batch-total-bar");
+const batchTotalCount = document.querySelector("#batch-total-count");
+const batchCompleteCount = document.querySelector("#batch-complete-count");
+const batchFailedCount = document.querySelector("#batch-failed-count");
+const batchPendingCount = document.querySelector("#batch-pending-count");
+const batchListCount = document.querySelector("#batch-list-count");
+const batchFeedback = document.querySelector("#batch-feedback");
 const toggleBatchLogsButton = document.querySelector("#toggle-batch-logs");
 const exportBatchLogsButton = document.querySelector("#export-batch-logs");
 const clearBatchLogsButton = document.querySelector("#clear-batch-logs");
@@ -52,6 +58,8 @@ let pendingFilename = "";
 let batchState = null;
 let batchDraft = { items: [], duplicateCount: 0, invalidCount: 0 };
 let batchMonitorTimer = null;
+const COLLAPSE_STATE_KEY = "sidePanelCollapseState";
+let collapseState = {};
 
 function activeTab() {
   return chrome.tabs.query({ active: true, lastFocusedWindow: true }).then(([tab]) => tab);
@@ -59,6 +67,42 @@ function activeTab() {
 
 function showStatus(message) {
   statusElement.textContent = message;
+}
+
+function showBatchFeedback(message) {
+  batchFeedback.textContent = message || "";
+}
+
+async function restoreCollapseState() {
+  try {
+    const result = await chrome.storage.session.get(COLLAPSE_STATE_KEY);
+    collapseState = result[COLLAPSE_STATE_KEY] && typeof result[COLLAPSE_STATE_KEY] === "object"
+      ? result[COLLAPSE_STATE_KEY]
+      : {};
+  } catch {
+    collapseState = {};
+  }
+}
+
+function bindCollapsible(element, key) {
+  element.dataset.collapseId = key;
+  element.open = collapseState[key] === true;
+  element.addEventListener("toggle", () => {
+    collapseState[key] = element.open;
+    void chrome.storage.session.set({ [COLLAPSE_STATE_KEY]: collapseState });
+  });
+}
+
+function safeLogExportText(value) {
+  return String(value || "")
+    .replace(/https?:\/\/[^\s?]+\?[^\s]+/gi, "[redacted URL]")
+    .replace(/(?:token|cookie|authorization|referer|origin)\s*[:=]\s*[^\s,;]+/gi, "$1=[redacted]")
+    .slice(0, 240);
+}
+
+function logExportTimestamp(date = new Date()) {
+  const part = (value) => String(value).padStart(2, "0");
+  return `${date.getFullYear()}${part(date.getMonth() + 1)}${part(date.getDate())}-${part(date.getHours())}${part(date.getMinutes())}${part(date.getSeconds())}`;
 }
 
 function setMode(mode) {
@@ -138,6 +182,8 @@ const batchStatusLabels = {
 function renderBatchDraft(draft) {
   batchDraft = draft || batchDraft;
   const count = batchDraft.items?.length || 0;
+  renderBatchOverview({ total: count, complete: 0, failed: 0, pending: count });
+  batchListCount.textContent = count ? `${count} 条任务` : "暂无任务";
   batchSummary.textContent = count
     ? `已解析 ${count} 条，等待开始 · 重复 ${batchDraft.duplicateCount || 0} 条 · 无效 ${batchDraft.invalidCount || 0} 条`
     : "尚未解析";
@@ -186,6 +232,13 @@ function batchCounts(state) {
   );
 }
 
+function renderBatchOverview(counts) {
+  batchTotalCount.textContent = counts.total || 0;
+  batchCompleteCount.textContent = counts.complete || 0;
+  batchFailedCount.textContent = counts.failed || 0;
+  batchPendingCount.textContent = counts.pending || 0;
+}
+
 function renderBatchState(state) {
   batchState = state;
   const tasks = state?.tasks || [];
@@ -198,6 +251,8 @@ function renderBatchState(state) {
   const counts = batchCounts({ tasks });
   const waiting = (counts.pending || 0) + (counts.navigating || 0) + (counts.detecting || 0) + (counts.preparing || 0) + (counts.downloading || 0);
   const current = tasks[state?.currentIndex] || null;
+  renderBatchOverview({ ...counts, pending: waiting });
+  batchListCount.textContent = counts.total ? `${counts.total} 条任务` : "暂无任务";
   batchSummary.textContent = `总数 ${counts.total} · 完成 ${counts.complete || 0} · 失败 ${counts.failed || 0} · 待处理 ${waiting}`;
   renderBatchItems(tasks);
 
@@ -236,15 +291,28 @@ function renderBatchState(state) {
 }
 
 function formatBatchLog(entry) {
-  const time = entry.timestamp ? new Date(entry.timestamp).toLocaleTimeString("zh-CN", { hour12: false }) : "--:--:--";
-  const count = Number.isInteger(entry.totalTasks) ? ` tasks=${entry.totalTasks}` : "";
-  const tab = Number.isInteger(entry.workerTabId) ? ` tab=${entry.workerTabId}` : "";
-  return `${time}  ${entry.event || "event"}${count}${tab}${entry.message ? `  ${entry.message}` : ""}`;
+  const time = entry.timestamp ? new Date(entry.timestamp).toLocaleString("zh-CN", { hour12: false }) : "未知时间";
+  const current = Number.isInteger(entry.currentIndex) ? entry.currentIndex + 1 : 0;
+  const total = Number.isInteger(entry.totalTasks) ? entry.totalTasks : 0;
+  const state = entry.batchStatus || "idle";
+  const taskState = entry.taskStatus ? `/${entry.taskStatus}` : "";
+  const message = safeLogExportText(entry.message);
+  const error = entry.taskStatus === "failed" || /error|fail/i.test(entry.event || "") ? ` error=${message || "未知错误"}` : "";
+  const detail = error || (message ? ` message=${message}` : "");
+  return `${time}  event=${entry.event || "event"}  status=${state}${taskState}  task=${current}/${total}${detail}`;
 }
 
 async function refreshBatchLogs() {
-  const result = await chrome.runtime.sendMessage({ type: "getBatchLogs" });
-  if (!result?.error) batchLogOutput.textContent = (result.entries || []).slice(-30).map(formatBatchLog).join("\n") || "暂无日志";
+  try {
+    const result = await chrome.runtime.sendMessage({ type: "getBatchLogs" });
+    if (result?.error) throw new Error(result.error);
+    const entries = result.entries || [];
+    batchLogOutput.textContent = entries.slice(-30).map(formatBatchLog).join("\n") || "当前没有运行日志";
+    return entries;
+  } catch (error) {
+    batchLogOutput.textContent = `日志读取失败：${error.message || "未知错误"}`;
+    return [];
+  }
 }
 
 function stopBatchMonitoring() {
@@ -465,19 +533,31 @@ function createCandidateCard(candidate, pageTitle, tabId) {
   filename.textContent = candidate.mediaFilename || candidate.url;
   filename.title = candidate.mediaFilename || candidate.url;
 
-  const url = document.createElement("code");
-  url.textContent = candidate.url;
-  url.title = candidate.url;
+  const details = document.createElement("details");
+  details.className = "advanced-info";
+  const collapseKey = `candidate-${candidate.id || `${candidate.mediaFilename || "media"}-${candidate.variant || candidate.kind || "other"}`}`;
+  bindCollapsible(details, collapseKey);
 
-  const details = document.createElement("p");
-  const source = candidate.sources?.join("、") || "未知来源";
-  details.textContent = `${source}${candidate.contentType ? ` · ${candidate.contentType}` : ""}`;
+  const summary = document.createElement("summary");
+  summary.textContent = "高级信息";
+
+  const advancedContent = document.createElement("div");
+  advancedContent.className = "advanced-content";
+  const url = document.createElement("code");
+  url.textContent = candidate.url || "未提供 URL";
+  url.title = candidate.url || "";
+
+  const source = document.createElement("p");
+  source.textContent = `来源：${candidate.sources?.join("、") || "未知来源"}${candidate.contentType ? ` · ${candidate.contentType}` : ""}`;
 
   const context = document.createElement("p");
   context.className = "context-diagnostic";
   context.textContent = `请求上下文：${formatContextPresence(candidate.context)}`;
 
-  card.append(heading, filename, url, details, context);
+  advancedContent.append(url, source, context);
+  details.append(summary, advancedContent);
+
+  card.append(heading, filename, details);
   return card;
 }
 
@@ -538,89 +618,156 @@ batchFile.addEventListener("change", async () => {
   try {
     batchLinks.value = await file.text();
     batchSummary.textContent = "TXT 已载入，请点击“解析链接”。";
+    showBatchFeedback(`已载入 ${file.name}`);
   } catch {
     batchSummary.textContent = "TXT 读取失败，请确认文件是 UTF-8 文本。";
+    showBatchFeedback("TXT 读取失败，请确认文件是 UTF-8 文本。");
   }
 });
 
 parseBatchButton.addEventListener("click", async () => {
+  parseBatchButton.disabled = true;
+  showBatchFeedback("正在解析链接…");
   const result = parseBatchLinks(batchLinks.value);
-  const draft = await chrome.runtime.sendMessage({
-    type: "saveBatchDraft",
-    items: result.items,
-    duplicateCount: result.duplicateCount,
-    invalidCount: result.invalidCount
-  });
-  if (draft?.error) {
-    batchSummary.textContent = draft.error;
-    return;
+  try {
+    const draft = await chrome.runtime.sendMessage({
+      type: "saveBatchDraft",
+      items: result.items,
+      duplicateCount: result.duplicateCount,
+      invalidCount: result.invalidCount
+    });
+    if (draft?.error) throw new Error(draft.error);
+    batchDraft = draft;
+    if (draft.acceptedCount !== result.items.length) {
+      throw new Error(`解析状态异常：前端 ${result.items.length} 条，后台接受 ${draft.acceptedCount || 0} 条`);
+    }
+    batchState = null;
+    renderBatchDraft(draft);
+    await refreshBatchLogs();
+    showBatchFeedback(result.items.length ? `已解析 ${result.items.length} 条链接。` : "当前没有可处理的腾讯会议链接。");
+  } catch (error) {
+    batchSummary.textContent = error.message || "解析链接失败。";
+    showBatchFeedback("解析失败，请检查链接格式。");
+  } finally {
+    parseBatchButton.disabled = false;
   }
-  batchDraft = draft;
-  if (draft.acceptedCount !== result.items.length) {
-    batchSummary.textContent = `解析状态异常：前端 ${result.items.length} 条，后台接受 ${draft.acceptedCount || 0} 条`;
-    return;
-  }
-  batchState = null;
-  renderBatchDraft(draft);
-  await refreshBatchLogs();
 });
 
 startBatchButton.addEventListener("click", async () => {
   startBatchButton.disabled = true;
   batchProgress.hidden = false;
   batchStatus.textContent = "正在启动批量任务…";
-  const state = await chrome.runtime.sendMessage({
-    type: "startBatch",
-    mediaPreference: mediaPreference.value,
-    items: batchDraft.items
-  });
-  startBatchButton.disabled = false;
-  if (state?.error) {
-    batchSummary.textContent = state.error;
+  showBatchFeedback("正在启动批量任务…");
+  try {
+    const state = await chrome.runtime.sendMessage({
+      type: "startBatch",
+      mediaPreference: mediaPreference.value,
+      items: batchDraft.items
+    });
+    if (state?.error) throw new Error(state.error);
+    renderBatchState(state);
+    monitorBatchState();
+    showBatchFeedback("批量任务已开始。");
+  } catch (error) {
+    batchSummary.textContent = error.message || "批量启动失败。";
+    showBatchFeedback("批量启动失败，请查看运行日志。");
     await refreshBatchLogs();
-    return;
+  } finally {
+    startBatchButton.disabled = false;
   }
-  renderBatchState(state);
-  monitorBatchState();
 });
 
 pauseBatchButton.addEventListener("click", async () => {
-  const state = await chrome.runtime.sendMessage({ type: "pauseBatch" });
-  if (!state?.error) renderBatchState(state);
+  pauseBatchButton.disabled = true;
+  try {
+    const state = await chrome.runtime.sendMessage({ type: "pauseBatch" });
+    if (state?.error) throw new Error(state.error);
+    renderBatchState(state);
+    showBatchFeedback("批量任务已暂停。");
+  } catch (error) {
+    showBatchFeedback(error.message || "暂停失败。");
+  } finally {
+    pauseBatchButton.disabled = false;
+  }
 });
 
 resumeBatchButton.addEventListener("click", async () => {
-  const state = await chrome.runtime.sendMessage({ type: "resumeBatch", mediaPreference: mediaPreference.value });
-  if (state?.error) {
-    batchSummary.textContent = state.error;
-    return;
+  resumeBatchButton.disabled = true;
+  try {
+    const state = await chrome.runtime.sendMessage({ type: "resumeBatch", mediaPreference: mediaPreference.value });
+    if (state?.error) throw new Error(state.error);
+    renderBatchState(state);
+    monitorBatchState();
+    showBatchFeedback("批量任务已继续。");
+  } catch (error) {
+    batchSummary.textContent = error.message || "继续失败。";
+    showBatchFeedback("继续失败，请查看运行日志。");
+  } finally {
+    resumeBatchButton.disabled = false;
   }
-  renderBatchState(state);
-  monitorBatchState();
 });
 
 toggleBatchLogsButton.addEventListener("click", async () => {
-  batchLogOutput.hidden = !batchLogOutput.hidden;
-  toggleBatchLogsButton.textContent = batchLogOutput.hidden ? "查看运行日志" : "收起运行日志";
-  if (!batchLogOutput.hidden) await refreshBatchLogs();
+  const visible = batchLogOutput.hidden;
+  batchLogOutput.hidden = !visible;
+  toggleBatchLogsButton.textContent = visible ? "收起日志" : "查看日志";
+  collapseState["batch-logs"] = visible;
+  void chrome.storage.session.set({ [COLLAPSE_STATE_KEY]: collapseState });
+  if (visible) await refreshBatchLogs();
 });
 
 exportBatchLogsButton.addEventListener("click", async () => {
-  const result = await chrome.runtime.sendMessage({ type: "getBatchLogs" });
-  const content = (result.entries || []).map(formatBatchLog).join("\n");
-  const blob = new Blob([content], { type: "text/plain;charset=utf-8" });
-  const url = URL.createObjectURL(blob);
-  const stamp = new Date().toISOString().replace(/[T:-]/g, "").replace(/\.\d{3}Z$/, "");
-  const link = document.createElement("a");
-  link.href = url;
-  link.download = `meeting-parser-batch-log-${stamp}.txt`;
-  link.click();
-  URL.revokeObjectURL(url);
+  exportBatchLogsButton.disabled = true;
+  showBatchFeedback("正在准备日志文件…");
+  let objectUrl = "";
+  try {
+    const result = await chrome.runtime.sendMessage({ type: "getBatchLogs" });
+    if (result?.error) throw new Error(result.error);
+    const entries = Array.isArray(result.entries) ? result.entries : [];
+    if (!entries.length) {
+      showBatchFeedback("当前没有可导出的日志。");
+      return;
+    }
+    const content = `${entries.map(formatBatchLog).join("\n")}\n`;
+    const blob = new Blob(["\uFEFF", content], { type: "text/plain;charset=utf-8" });
+    objectUrl = URL.createObjectURL(blob);
+    const filename = `meeting-parser-log-${logExportTimestamp()}.txt`;
+    await new Promise((resolve, reject) => {
+      if (!chrome.downloads?.download) {
+        const link = document.createElement("a");
+        link.href = objectUrl;
+        link.download = filename;
+        link.click();
+        resolve();
+        return;
+      }
+      chrome.downloads.download({ url: objectUrl, filename, saveAs: false }, (downloadId) => {
+        const error = chrome.runtime.lastError;
+        if (error) reject(new Error(error.message));
+        else resolve(downloadId);
+      });
+    });
+    showBatchFeedback(`日志已导出：${filename}`);
+  } catch (error) {
+    showBatchFeedback(`日志导出失败：${error.message || "未知错误"}`);
+  } finally {
+    exportBatchLogsButton.disabled = false;
+    if (objectUrl) setTimeout(() => URL.revokeObjectURL(objectUrl), 1000);
+  }
 });
 
 clearBatchLogsButton.addEventListener("click", async () => {
-  await chrome.runtime.sendMessage({ type: "clearBatchLogs" });
-  await refreshBatchLogs();
+  clearBatchLogsButton.disabled = true;
+  try {
+    const result = await chrome.runtime.sendMessage({ type: "clearBatchLogs" });
+    if (result?.error) throw new Error(result.error);
+    await refreshBatchLogs();
+    showBatchFeedback("运行日志已清空。");
+  } catch (error) {
+    showBatchFeedback(`清空日志失败：${error.message || "未知错误"}`);
+  } finally {
+    clearBatchLogsButton.disabled = false;
+  }
 });
 
 chrome.runtime.onMessage.addListener((message) => {
@@ -645,14 +792,19 @@ chrome.runtime.onMessage.addListener((message) => {
 });
 
 refreshButton.addEventListener("click", refresh);
-void Promise.all([
-  chrome.runtime.sendMessage({ type: "getBatchDraft" }),
-  chrome.runtime.sendMessage({ type: "getBatchState" })
-]).then(([draft, state]) => {
-  if (!draft?.error) renderBatchDraft(draft);
-  if (!state?.error) {
-    renderBatchState(state);
-    if (["starting", "running"].includes(state.status) || state.tasks?.[state.currentIndex]?.status === "downloading") monitorBatchState();
-  }
+void restoreCollapseState().then(() => {
+  const logsVisible = collapseState["batch-logs"] === true;
+  batchLogOutput.hidden = !logsVisible;
+  toggleBatchLogsButton.textContent = logsVisible ? "收起日志" : "查看日志";
+  return Promise.all([
+    chrome.runtime.sendMessage({ type: "getBatchDraft" }),
+    chrome.runtime.sendMessage({ type: "getBatchState" })
+  ]).then(([draft, state]) => {
+    if (!draft?.error) renderBatchDraft(draft);
+    if (!state?.error) {
+      renderBatchState(state);
+      if (["starting", "running"].includes(state.status) || state.tasks?.[state.currentIndex]?.status === "downloading") monitorBatchState();
+    }
+    void refresh();
+  });
 });
-void refresh();

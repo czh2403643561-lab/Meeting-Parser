@@ -3,81 +3,157 @@
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>媒体资源嗅探器</title>
+    <title>Media Resource Finder</title>
     <link rel="stylesheet" href="sidepanel.css" />
   </head>
   <body>
-    <main>
-      <nav class="mode-tabs" aria-label="下载模式">
-        <button id="single-tab" class="mode-tab active" type="button" aria-selected="true">单个下载</button>
-        <button id="batch-tab" class="mode-tab" type="button" aria-selected="false">批量下载</button>
+    <main class="app-shell">
+      <header class="app-header">
+        <div class="brand-lockup">
+          <img class="brand-mark" src="icons/icon-32.png" alt="" />
+          <div>
+            <strong>Media Resource Finder</strong>
+            <span>会议媒体下载工具</span>
+          </div>
+        </div>
+        <span class="brand-status">本地安全处理</span>
+      </header>
+
+      <nav class="mode-tabs" aria-label="下载模式" role="tablist">
+        <button id="single-tab" class="mode-tab active" type="button" role="tab" aria-selected="true">
+          <span class="tab-icon">◉</span> 单个下载
+        </button>
+        <button id="batch-tab" class="mode-tab" type="button" role="tab" aria-selected="false">
+          <span class="tab-icon">☷</span> 批量下载
+        </button>
       </nav>
 
-      <section id="single-view">
-        <header>
+      <section id="single-view" class="view" role="tabpanel">
+        <div class="view-heading">
           <div>
+            <p class="eyebrow">当前页面</p>
             <h1>媒体资源</h1>
-            <p id="page-title">正在读取当前页面…</p>
+            <p id="page-title" class="subtle-text">正在读取当前页面…</p>
           </div>
-          <button id="refresh" type="button">刷新</button>
-        </header>
+          <button id="refresh" class="icon-button" type="button" title="刷新当前页面资源" aria-label="刷新当前页面资源">↻</button>
+        </div>
 
-        <section id="download-area" class="download-area" hidden>
-          <div class="download-heading">
-            <strong>当前下载</strong>
-            <button id="clear-download" class="secondary-button" type="button" hidden>清除记录</button>
+        <p id="status" class="inline-status" role="status"></p>
+
+        <section id="download-area" class="panel download-area" hidden>
+          <div class="section-head">
+            <div>
+              <p class="eyebrow">任务状态</p>
+              <h2>当前下载</h2>
+            </div>
+            <button id="clear-download" class="text-button" type="button" hidden>清除记录</button>
           </div>
-          <p id="download-status" role="status"></p>
+          <p id="download-status" class="download-status" role="status"></p>
           <progress id="download-progress" max="100" value="0" hidden></progress>
-          <p id="download-size"></p>
+          <p id="download-size" class="subtle-text"></p>
         </section>
 
-        <p id="status" role="status"></p>
-        <section id="candidates" aria-live="polite"></section>
+        <section class="resource-section">
+          <div class="section-head">
+            <div>
+              <p class="eyebrow">发现结果</p>
+              <h2>候选资源</h2>
+            </div>
+          </div>
+          <section id="candidates" aria-live="polite"></section>
+        </section>
       </section>
 
-      <section id="batch-view" hidden>
-        <h1>批量下载</h1>
-        <p class="batch-note">严格按顺序下载；工作标签页关闭后可继续任务。</p>
-        <label class="file-picker">
-          <span>导入 TXT</span>
-          <input id="batch-file" type="file" accept=".txt,text/plain" />
-        </label>
-        <textarea id="batch-links" rows="8" placeholder="也可以直接粘贴腾讯会议链接，每行一个"></textarea>
-        <button id="parse-batch" type="button">解析链接</button>
-        <label class="preference-label">优先下载
-          <select id="media-preference">
-            <option value="auto">自动（普通录制优先）</option>
-            <option value="screen">屏幕画面</option>
-            <option value="speaker">发言人画面</option>
-          </select>
-        </label>
-        <p id="batch-summary" class="batch-summary">尚未解析</p>
-        <section id="batch-total-progress" class="batch-progress" hidden>
-          <strong id="batch-total-label"></strong>
+      <section id="batch-view" class="view" role="tabpanel" hidden>
+        <div class="view-heading">
+          <div>
+            <p class="eyebrow">连续任务</p>
+            <h1>批量下载</h1>
+            <p class="subtle-text">严格按顺序下载；工作标签页关闭后可继续任务。</p>
+          </div>
+        </div>
+
+        <section class="panel batch-input-panel">
+          <div class="section-head">
+            <div>
+              <p class="eyebrow">第一步</p>
+              <h2>添加会议链接</h2>
+            </div>
+            <label class="secondary-button file-picker">
+              导入 TXT
+              <input id="batch-file" type="file" accept=".txt,text/plain" />
+            </label>
+          </div>
+          <textarea id="batch-links" rows="6" placeholder="粘贴腾讯会议链接，每行一个"></textarea>
+          <div class="batch-control-row">
+            <button id="parse-batch" type="button">解析链接</button>
+            <label class="preference-label">
+              <span>优先下载</span>
+              <select id="media-preference">
+                <option value="auto">自动 · 普通录制优先</option>
+                <option value="screen">屏幕画面</option>
+                <option value="speaker">发言人画面</option>
+              </select>
+            </label>
+          </div>
+          <p id="batch-summary" class="batch-summary">尚未解析</p>
+          <p id="batch-feedback" class="action-feedback" role="status" aria-live="polite"></p>
+        </section>
+
+        <section class="summary-grid" aria-label="批量任务总览">
+          <div class="summary-card"><span>总数</span><strong id="batch-total-count">0</strong></div>
+          <div class="summary-card"><span>完成</span><strong id="batch-complete-count">0</strong></div>
+          <div class="summary-card"><span>失败</span><strong id="batch-failed-count">0</strong></div>
+          <div class="summary-card"><span>待处理</span><strong id="batch-pending-count">0</strong></div>
+        </section>
+
+        <section id="batch-total-progress" class="panel progress-panel" hidden>
+          <div class="section-head compact-head">
+            <h2>批量总进度</h2>
+            <strong id="batch-total-label"></strong>
+          </div>
           <progress id="batch-total-bar" max="100" value="0"></progress>
         </section>
-        <section id="batch-progress" class="batch-progress" hidden>
-          <strong id="batch-current"></strong>
-          <p id="batch-status" role="status"></p>
-          <progress id="batch-file-progress" max="100" value="0" hidden></progress>
-          <p id="batch-size"></p>
-        </section>
-        <ol id="batch-list" class="batch-list"></ol>
-        <div class="batch-actions">
-          <button id="start-batch" type="button">开始批量下载</button>
-          <button id="pause-batch" class="secondary-button" type="button" hidden>暂停</button>
-          <button id="resume-batch" type="button" hidden>继续</button>
-        </div>
-        <section class="batch-logs">
-          <div class="download-heading">
-            <strong>运行日志</strong>
-            <span>
-              <button id="toggle-batch-logs" class="secondary-button" type="button">查看运行日志</button>
-              <button id="export-batch-logs" class="secondary-button" type="button">导出日志</button>
-              <button id="clear-batch-logs" class="secondary-button" type="button">清空日志</button>
-            </span>
+
+        <section id="batch-progress" class="panel progress-panel current-task-panel" hidden>
+          <div class="section-head compact-head">
+            <h2 id="batch-current">当前任务</h2>
+            <span class="live-badge">进行中</span>
           </div>
+          <p id="batch-status" class="download-status" role="status"></p>
+          <progress id="batch-file-progress" max="100" value="0" hidden></progress>
+          <p id="batch-size" class="subtle-text"></p>
+        </section>
+
+        <section class="panel task-list-panel">
+          <div class="section-head compact-head">
+            <div>
+              <p class="eyebrow">执行顺序</p>
+              <h2>任务列表</h2>
+            </div>
+            <span id="batch-list-count" class="subtle-text"></span>
+          </div>
+          <ol id="batch-list" class="batch-list"></ol>
+          <div class="batch-actions">
+            <button id="start-batch" type="button">开始批量下载</button>
+            <button id="pause-batch" class="secondary-button" type="button" hidden>暂停</button>
+            <button id="resume-batch" type="button" hidden>继续</button>
+          </div>
+        </section>
+
+        <section class="panel batch-logs">
+          <div class="section-head compact-head">
+            <div>
+              <p class="eyebrow">安全诊断</p>
+              <h2>运行日志</h2>
+            </div>
+            <div class="log-actions">
+              <button id="toggle-batch-logs" class="secondary-button" type="button">查看日志</button>
+              <button id="export-batch-logs" class="secondary-button" type="button">导出日志</button>
+              <button id="clear-batch-logs" class="text-button" type="button">清空</button>
+            </div>
+          </div>
+          <p class="subtle-text log-note">仅包含时间、事件、状态和任务进度，不包含媒体签名或请求头。</p>
           <pre id="batch-log-output" hidden></pre>
         </section>
       </section>
