@@ -2,28 +2,28 @@
 
 ## 已完成
 
-- 单条 MP4 和串行批量下载核心、Native Host、腾讯会议解析逻辑未修改。
-- 新增 `.github/workflows/release.yml`：`v*` 标签构建并发布正式 Release，`workflow_dispatch` 只上传 Actions artifact。
-- 修正 Companion 构建脚本，使 workflow 使用 Python 3.12 时不会错误追加 `-3` 参数。
-- 扩展新增安装包可用性检查：未发布和网络不可用时不创建 Chrome 失败下载项，并显示普通用户提示。
-- 安装包下载改为通过 `chrome.downloads.onChanged` 等待真实完成或中断状态。
-- `v0.6.3` GitHub Actions 已成功完成，Release asset 严格命名为 `MeetingParserSetup.exe`。
-- `releases/latest/download/MeetingParserSetup.exe` 已验证返回 200、`application/octet-stream`，大小约 10.98 MB。
-- Setup、Host、扩展版本和 `MIN_COMPANION_VERSION` 仍保持 0.6.0 兼容。
+- 单条 MP4、串行批量下载、Native Messaging 单 Host 架构、腾讯会议解析、文件命名和批量队列未修改。
+- GitHub Release 自动发布链路已实现，`v0.6.3` Release asset 为 `MeetingParserSetup.exe`。
+- 安装包可用性检查和真实下载状态监听已实现。
+- 安装器固定使用 `%LOCALAPPDATA%\MeetingParser`，隐藏目录选择页，并保留明确的安装完成提示。
+- 安装完成后生成 `MeetingParserHost.exe`、`com.meetingparser.helper.json`，Chrome/Edge HKCU 注册表均指向该 manifest。
+- 升级时继续清理旧文件和旧 Host 进程，不影响 Chrome 或其他程序；浏览器触发的下载中仍由现有更新保护阻止升级。
+- `scripts/build_setup.ps1` 构建前清理旧 `MeetingParserSetup.exe`，输出文件名、版本和实际路径。
+- Setup、Host、扩展和 `MIN_COMPANION_VERSION` 当前统一兼容版本 `0.6.0`。
 
-## 当前
+## 已真实验证
 
-- GitHub Release 发布链路和 latest 直链已真实可用。
-- 扩展代码已完成本地语法、现有协议/命名测试，并用 Python 3.12 成功构建 Companion EXE。
-- 本轮尚未把“浏览器插件 Side Panel 点击安装本地组件后的最终 UI 提示”写成已验证完成。
+- `0.6.0` Setup 可以安装，且本机已验证自动安装到 `%LOCALAPPDATA%\MeetingParser`。
+- 安装后生成的 Host、manifest、Chrome/Edge 注册表路径正确，旧架构文件不存在。
+- 用户已真实验证安装后 Chrome 插件能够识别 Native Host。
 
-## 问题
+## 仍待验证
 
-- 当前浏览器自动化无法操作 `chrome://extensions` 刷新已加载的本地扩展，也无法稳定捕获 `.exe` 下载完成事件。
-- 因此尚未完成插件界面层面的“点击安装本地组件 → Chrome 下载完成 → 显示成功提示”闭环验收。
-- 工作区中的未跟踪 `MeetingParser/` 安装目录为已有用户文件，本轮未修改、未提交。
+- 固定 `%LOCALAPPDATA%\MeetingParser` 安装后的浏览器完整流程，以及 Side Panel 最终显示“环境已准备好”。
+- 插件内直接下载安装包的完整浏览器验收。
+- 干净新电脑上的安装和 Native Host 识别。
 
 ## 下一步
 
-- 在 Chrome 扩展管理页手动刷新本地扩展后，点击“安装本地组件”，确认下载完成提示为“安装程序已下载，请运行 MeetingParserSetup.exe”。
-- 该浏览器验收通过后，再将状态更新为真实验证完成；Native Host 安装后的完整功能测试另行进行。
+- 在 Chrome 扩展管理页刷新本地扩展后，使用固定 LocalAppData 安装结果完成 Side Panel、单条下载和“重新检测”验收。
+- 通过后再更新状态；不将当前结果描述为普通用户一键安装全部完成。

@@ -4,8 +4,10 @@ AppName=Meeting Parser
 AppVersion=0.6.0
 AppPublisher=Meeting Parser
 DefaultDirName={localappdata}\MeetingParser
+DisableDirPage=yes
 PrivilegesRequired=lowest
 DisableProgramGroupPage=yes
+DisableFinishedPage=no
 Uninstallable=yes
 OutputDir={#ReleaseDir}
 OutputBaseFilename=MeetingParserSetup
@@ -14,6 +16,10 @@ SolidCompression=yes
 WizardStyle=modern
 CloseApplications=no
 RestartApplications=no
+
+[Messages]
+FinishedHeadingLabel=Meeting Parser 本地组件安装完成
+FinishedLabel=Meeting Parser 本地组件已安装完成。%n现在可以返回浏览器继续使用插件。
 
 [Files]
 Source: "{#CompanionDir}\MeetingParserHost.exe"; DestDir: "{app}"; Flags: ignoreversion

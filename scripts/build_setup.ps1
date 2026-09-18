@@ -12,6 +12,18 @@ $companionBuildScript = Join-Path $PSScriptRoot "build_companion.ps1"
 $issPath = Join-Path $projectRoot "installer\MeetingParserSetup.iss"
 $companionDirectory = Join-Path $projectRoot "dist\companion"
 $releaseDirectory = Join-Path $projectRoot "dist\release"
+$setupPath = Join-Path $releaseDirectory "MeetingParserSetup.exe"
+
+New-Item -ItemType Directory -Force -Path $releaseDirectory | Out-Null
+if (Test-Path -LiteralPath $setupPath) {
+  Remove-Item -LiteralPath $setupPath -Force
+}
+
+$versionMatch = Select-String -Path $issPath -Pattern '^AppVersion=(.+)$' | Select-Object -First 1
+if (-not $versionMatch) {
+  throw "未找到安装包版本号。"
+}
+$setupVersion = $versionMatch.Matches[0].Groups[1].Value.Trim()
 
 & $companionBuildScript -Python $Python
 if ($LASTEXITCODE -ne 0) {
@@ -35,10 +47,18 @@ if ([string]::IsNullOrWhiteSpace($InnoCompiler) -or -not (Test-Path -LiteralPath
   throw "未找到 Inno Setup 编译器 ISCC.exe。请安装 Inno Setup 6，或通过 -InnoCompiler 指定路径。"
 }
 
-New-Item -ItemType Directory -Force -Path $releaseDirectory | Out-Null
 & $InnoCompiler "/DCompanionDir=$companionDirectory" "/DReleaseDir=$releaseDirectory" $issPath
 if ($LASTEXITCODE -ne 0) {
   throw "MeetingParserSetup.exe 构建失败。"
 }
 
-Write-Output "安装程序构建完成：$(Join-Path $releaseDirectory 'MeetingParserSetup.exe')"
+if (-not (Test-Path -LiteralPath $setupPath -PathType Leaf)) {
+  throw "MeetingParserSetup.exe 构建产物不存在。"
+}
+if ((Get-Item -LiteralPath $setupPath).Length -le 0) {
+  throw "MeetingParserSetup.exe 构建产物为空。"
+}
+
+Write-Output "MeetingParserSetup.exe"
+Write-Output "Version: $setupVersion"
+Write-Output "Path: $setupPath"
