@@ -105,6 +105,8 @@ function isScrollableTranscriptElement(element) {
 }
 
 function findTranscriptContainer() {
+  const explicitRoot = document.querySelector("#minutes-scroll-container");
+  const scopedElements = explicitRoot ? [explicitRoot, ...explicitRoot.querySelectorAll("*")] : [];
   const labelElements = [...document.querySelectorAll("body *")]
     .filter((element) => /逐字稿/iu.test(element.textContent || "") && (element.textContent || "").length < 120);
   const roots = new Set();
@@ -113,7 +115,7 @@ function findTranscriptContainer() {
     for (let depth = 0; current && depth < 8; depth += 1, current = current.parentElement) roots.add(current);
   }
 
-  const candidates = new Set();
+  const candidates = new Set(scopedElements);
   for (const root of roots) {
     if (isScrollableTranscriptElement(root)) candidates.add(root);
     for (const element of root.querySelectorAll("*")) {
@@ -126,16 +128,22 @@ function findTranscriptContainer() {
 
   const scored = [...candidates].map((element) => {
     const text = transcriptElementText(element);
+    const pidCount = element.querySelectorAll?.('[id^="pid-"][id$="-content"]').length || 0;
     const chineseCount = chineseCharacterCount(text);
-    const relatedToLabel = labelElements.some((label) => element.contains(label));
+    const relatedToLabel = explicitRoot === element || labelElements.some((label) => element.contains(label));
     return {
       element,
-      score: chineseCount + Math.min(text.length, 8000) / 10 + (relatedToLabel ? 900 : 0),
+      score: pidCount * 10000 + chineseCount + Math.min(text.length, 8000) / 10 + (relatedToLabel ? 900 : 0),
+      pidCount,
       textLength: text.length
     };
-  }).filter((candidate) => candidate.textLength >= 40 && chineseCharacterCount(candidate.element.innerText || "") >= 20);
+  }).filter((candidate) => candidate.textLength >= 40
+    && chineseCharacterCount(candidate.element.innerText || "") >= 20
+    && (candidate.pidCount > 0 || isScrollableTranscriptElement(candidate.element)));
 
-  const bestScrollable = scored.sort((left, right) => right.score - left.score)[0];
+  const bestScrollable = scored
+    .filter((candidate) => isScrollableTranscriptElement(candidate.element))
+    .sort((left, right) => right.score - left.score)[0];
   if (bestScrollable) return bestScrollable.element;
 
   const fallback = [...roots]
@@ -145,7 +153,22 @@ function findTranscriptContainer() {
   return fallback?.element || null;
 }
 
+function transcriptPidOrder(element) {
+  const match = String(element.id || "").match(/^pid-(\d+)-content$/u);
+  return match ? Number(match[1]) : null;
+}
+
 function collectTranscriptBlocks(container, excludedLines) {
+  const pidNodes = [...container.querySelectorAll('[id^="pid-"][id$="-content"]')]
+    .filter((element) => visibleTranscriptElement(element))
+    .map((element) => ({
+      element,
+      text: transcriptElementText(element, excludedLines),
+      order: transcriptPidOrder(element)
+    }))
+    .filter((block) => block.text.length >= 4 && chineseCharacterCount(block.text) >= 2);
+  if (pidNodes.length) return pidNodes;
+
   const blocks = [];
   const visit = (element) => {
     if (!visibleTranscriptElement(element) || transcriptElementLooksLikeUi(element)) return;
@@ -160,7 +183,7 @@ function collectTranscriptBlocks(container, excludedLines) {
       for (const child of childElements) visit(child);
       return;
     }
-    if (text.length >= 4 && chineseCharacterCount(text) >= 2) blocks.push({ element, text });
+    if (text.length >= 4 && chineseCharacterCount(text) >= 2) blocks.push({ element, text, order: null });
   };
 
   for (const child of container.children) visit(child);
@@ -180,10 +203,10 @@ function transcriptBlockKey(block) {
     || element.getAttribute?.("data-pid")
     || element.getAttribute?.("data-index")
     || element.getAttribute?.("data-key");
-  return stableIdentity ? `${stableIdentity}:${block.text}` : block.text;
+  return stableIdentity || block.text;
 }
 
-function waitForTranscriptRender(delayMs = 220) {
+function waitForTranscriptRender(delayMs = 280) {
   return new Promise((resolve) => setTimeout(resolve, delayMs));
 }
 
@@ -194,7 +217,8 @@ async function extractFullTranscript() {
   const excludedLines = transcriptMetadataLines(container);
   const originalScrollTop = container.scrollTop;
   const records = [];
-  const seenKeys = new Set();
+  const recordIndexes = new Map();
+  let fallbackOrder = 0;
   let stableBottomPasses = 0;
 
   try {
@@ -206,19 +230,31 @@ async function extractFullTranscript() {
       let added = 0;
       for (const block of blocks) {
         const key = transcriptBlockKey(block);
-        if (seenKeys.has(key)) continue;
-        seenKeys.add(key);
-        records.push(block.text);
+        const existingIndex = recordIndexes.get(key);
+        if (existingIndex !== undefined) {
+          if (block.text.length > records[existingIndex].text.length) records[existingIndex].text = block.text;
+          continue;
+        }
+        records.push({
+          order: Number.isFinite(block.order) ? block.order : 1000000 + fallbackOrder,
+          text: block.text
+        });
+        recordIndexes.set(key, records.length - 1);
+        fallbackOrder += 1;
         added += 1;
       }
 
       const maxScrollTop = Math.max(0, container.scrollHeight - container.clientHeight);
       const atBottom = container.scrollTop >= maxScrollTop - 4;
-      if (atBottom && added === 0) stableBottomPasses += 1;
+      const previousScrollHeight = container.scrollHeight;
+      if (atBottom && added === 0) {
+        await waitForTranscriptRender();
+        stableBottomPasses = container.scrollHeight <= previousScrollHeight ? stableBottomPasses + 1 : 0;
+      }
       else stableBottomPasses = 0;
-      if (stableBottomPasses >= 2) break;
+      if (stableBottomPasses >= 3) break;
 
-      const nextScrollTop = Math.min(maxScrollTop, container.scrollTop + Math.max(container.clientHeight * 0.85, 320));
+      const nextScrollTop = Math.min(maxScrollTop, container.scrollTop + Math.max(container.clientHeight * 0.7, 260));
       if (nextScrollTop === container.scrollTop && atBottom) {
         await waitForTranscriptRender();
       } else {
@@ -231,7 +267,8 @@ async function extractFullTranscript() {
     container.scrollTop = originalScrollTop;
   }
 
-  const fullText = records.join("\n\n").trim();
+  records.sort((left, right) => left.order - right.order);
+  const fullText = records.map((record) => record.text).join("\n\n").trim();
   if (!fullText) return { transcriptFound: false };
   return {
     transcriptFound: true,

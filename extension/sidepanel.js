@@ -8,6 +8,7 @@ const diagnosticFeedback = document.querySelector("#diagnostic-feedback");
 const diagnosticResults = document.querySelector("#diagnostic-results");
 const diagnosticPage = document.querySelector("#diagnostic-page");
 const diagnosticVideo = document.querySelector("#diagnostic-video");
+const diagnosticStatus = document.querySelector("#diagnostic-status");
 const diagnosticTranscript = document.querySelector("#diagnostic-transcript");
 const diagnosticParagraphCount = document.querySelector("#diagnostic-paragraph-count");
 const diagnosticTextLength = document.querySelector("#diagnostic-text-length");
@@ -807,6 +808,7 @@ function renderPageDiagnostic(result, tab) {
   diagnosticPage.textContent = `${pageTitle}\n${pageUrl}\n腾讯会议录制页面：${pageKind}`;
   diagnosticPage.title = result?.pageUrl || tab?.url || "";
   diagnosticVideo.textContent = `${result?.videoCount ?? 0} 个视频元素`;
+  diagnosticStatus.textContent = transcript ? "完成" : "未找到逐字稿";
   diagnosticTranscript.textContent = transcript ? "已发现疑似正文" : "未发现疑似正文";
   diagnosticParagraphCount.textContent = transcript ? String(transcript.paragraphCount ?? 0) : "—";
   diagnosticTextLength.textContent = transcript ? String(transcript.textLength ?? 0) : "—";
@@ -818,7 +820,8 @@ function renderPageDiagnostic(result, tab) {
 async function runPageDiagnostic() {
   runPageDiagnosticButton.disabled = true;
   diagnosticResults.hidden = true;
-  diagnosticFeedback.textContent = "正在检测当前页面…";
+  diagnosticStatus.textContent = "解析中";
+  diagnosticFeedback.textContent = "正在提取逐字稿…";
   try {
     const tab = await activeTab();
     if (!tab?.id) throw new Error("无法读取当前页面。");
@@ -826,9 +829,10 @@ async function runPageDiagnostic() {
     if (!result) throw new Error("当前页面暂不支持诊断。");
     renderPageDiagnostic(result, tab);
     diagnosticFeedback.textContent = result.transcriptFound
-      ? "检测完成，已找到逐字稿候选正文。"
-      : "检测完成，暂未找到逐字稿正文。";
+      ? `提取完成，共 ${result.paragraphCount} 段，${result.textLength} 字。`
+      : "提取完成，暂未找到逐字稿正文。";
   } catch (error) {
+    diagnosticStatus.textContent = "失败";
     diagnosticFeedback.textContent = error.message || "当前页面不可读取。";
   } finally {
     runPageDiagnosticButton.disabled = false;
