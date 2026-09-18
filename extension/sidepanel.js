@@ -220,7 +220,7 @@ function renderBatchItems(items) {
   batchList.replaceChildren();
   for (const item of items) {
     const row = document.createElement("li");
-    const title = item.pageTitle || item.pageUrl || item.url;
+    const title = item.recordingTitle || item.pageTitle || item.pageUrl || item.url;
     row.textContent = truncateUrl(title);
     row.title = item.pageUrl || item.url || title;
     const state = document.createElement("small");
@@ -293,7 +293,7 @@ function renderBatchState(state) {
   batchProgress.hidden = !current;
   if (current) {
     batchCurrent.textContent = `当前第 ${current.index + 1} / ${counts.total}`;
-    batchStatus.textContent = state.statusMessage || `${batchStatusLabels[current.status] || current.status}${current.filename ? `：${current.filename}` : current.pageTitle ? `：${current.pageTitle}` : ""}`;
+    batchStatus.textContent = state.statusMessage || `${batchStatusLabels[current.status] || current.status}${current.filename ? `：${current.filename}` : current.recordingTitle || current.pageTitle ? `：${current.recordingTitle || current.pageTitle}` : ""}`;
     const totalBytes = Number.isFinite(current.totalBytes) ? current.totalBytes : null;
     if (totalBytes !== null && current.status === "downloading") {
       const progress = Number.isFinite(current.progress) ? current.progress : 0;
@@ -480,7 +480,7 @@ async function restoreActiveDownload() {
   if (!isTerminal(result)) monitorLocalDownload(result.taskId);
 }
 
-function createCandidateCard(candidate, pageTitle, tabId) {
+function createCandidateCard(candidate, page, tabId) {
   const card = document.createElement("article");
   card.className = "candidate";
 
@@ -498,7 +498,8 @@ function createCandidateCard(candidate, pageTitle, tabId) {
     download.textContent = "下载 MP4";
     download.addEventListener("click", async () => {
       download.disabled = true;
-      pendingFilename = `${pageTitle || "media"}.mp4`;
+      const displayTitle = page.recordingTitle || page.title || "media";
+      pendingFilename = `${displayTitle}.mp4`;
       renderDownload({ status: "preparing", filename: pendingFilename, bytes: 0 });
       try {
         const health = await chrome.runtime.sendMessage({ type: "checkLocalDownloader" });
@@ -517,7 +518,8 @@ function createCandidateCard(candidate, pageTitle, tabId) {
           type: "downloadMp4",
           candidateId: candidate.id,
           contentType: candidate.contentType,
-          pageTitle,
+          recordingTitle: page.recordingTitle || "",
+          pageTitle: page.title || "",
           tabId
         });
         if (result?.error) {
@@ -588,7 +590,7 @@ function createCandidateCard(candidate, pageTitle, tabId) {
   return card;
 }
 
-function renderCandidates(candidates, pageTitle, tabId) {
+function renderCandidates(candidates, page, tabId) {
   candidatesElement.replaceChildren();
   if (!candidates.length) {
     const empty = document.createElement("p");
@@ -598,7 +600,7 @@ function renderCandidates(candidates, pageTitle, tabId) {
     return;
   }
   for (const candidate of candidates) {
-    candidatesElement.append(createCandidateCard(candidate, pageTitle, tabId));
+    candidatesElement.append(createCandidateCard(candidate, page, tabId));
   }
 }
 
@@ -614,9 +616,9 @@ async function refresh() {
 
     const result = await chrome.runtime.sendMessage({ type: "getCandidates", tabId: tab.id });
     if (result?.error) throw new Error(result.error);
-    const pageTitle = result.page?.title || tab.title || "当前页面";
-    pageTitleElement.textContent = pageTitle;
-    renderCandidates(result.candidates || [], pageTitle, tab.id);
+    const page = result.page || {};
+    pageTitleElement.textContent = page.recordingTitle || page.title || tab.title || "当前页面";
+    renderCandidates(result.candidates || [], page, tab.id);
     showStatus(result.candidates?.length ? `已找到 ${result.candidates.length} 个候选资源。` : "未发现可识别的媒体请求。");
     await restoreActiveDownload();
   } catch (error) {

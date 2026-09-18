@@ -23,6 +23,81 @@ function collectVideoUrls() {
   return [...urls];
 }
 
+function isTencentRecordingPage() {
+  return /(^|\.)meeting\.tencent\.com$/i.test(location.hostname)
+    && /^\/(?:crm|cw)\//i.test(location.pathname);
+}
+
+function visibleTitleElement(element) {
+  if (!element || element.hidden || element.getAttribute("aria-hidden") === "true") return false;
+  const style = typeof getComputedStyle === "function" ? getComputedStyle(element) : null;
+  return !style || (style.display !== "none" && style.visibility !== "hidden");
+}
+
+function titleElementScore(element, text, order) {
+  const tagName = String(element.tagName || "").toLowerCase();
+  const semantic = [
+    element.id,
+    element.className,
+    element.getAttribute?.("data-testid"),
+    element.getAttribute?.("data-test"),
+    element.getAttribute?.("aria-label")
+  ].filter(Boolean).join(" ");
+  const rect = typeof element.getBoundingClientRect === "function"
+    ? element.getBoundingClientRect()
+    : { top: 0 };
+  let score = Math.max(0, 36 - Math.min(Math.max(rect.top || 0, 0), 360) / 12);
+  if (["h1", "h2", "h3"].includes(tagName)) score += 40;
+  if (element.getAttribute?.("role") === "heading") score += 34;
+  if (/(title|subject|topic|record|name)/iu.test(semantic)) score += 20;
+  if (text.length >= 4 && text.length <= 120) score += 12;
+  if (text.length > 180) score -= 18;
+  return score - order / 1000;
+}
+
+function extractRecordingTitleDetails() {
+  const candidates = new Map();
+  if (isTencentRecordingPage()) {
+    const selectors = [
+      "h1",
+      "h2",
+      "h3",
+      '[role="heading"]',
+      '[data-testid*="title" i]',
+      '[data-test*="title" i]',
+      '[class*="record" i][class*="title" i]',
+      '[class*="meeting" i][class*="title" i]',
+      '[class*="title" i]'
+    ];
+    let order = 0;
+    for (const selector of selectors) {
+      for (const element of document.querySelectorAll(selector)) {
+        const text = normalizeRecordingTitle(element.textContent);
+        if (!visibleTitleElement(element) || !text) {
+          order += 1;
+          continue;
+        }
+        const score = titleElementScore(element, text, order);
+        if (!candidates.has(text) || candidates.get(text).score < score) {
+          candidates.set(text, { score, title: text });
+        }
+        order += 1;
+      }
+    }
+  }
+
+  const best = [...candidates.values()].sort((left, right) => right.score - left.score)[0];
+  if (best?.title) return { title: best.title, source: "录制标题" };
+
+  const documentTitle = normalizeRecordingTitle(cleanDocumentTitle(document.title));
+  if (documentTitle) return { title: documentTitle, source: "document.title" };
+  return { title: "录制文件", source: "fallback" };
+}
+
+function extractRecordingTitle() {
+  return extractRecordingTitleDetails().title;
+}
+
 function sendRuntimeMessage(message) {
   try {
     const response = chrome.runtime.sendMessage(message, () => {
@@ -39,10 +114,13 @@ function sendRuntimeMessage(message) {
 }
 
 function sendMetadata() {
+  const titleDetails = extractRecordingTitleDetails();
   sendRuntimeMessage({
     type: "pageMetadata",
     pageUrl: location.href,
     pageTitle: document.title,
+    recordingTitle: titleDetails.title,
+    recordingTitleSource: titleDetails.source,
     userAgent: navigator.userAgent,
     videoUrls: collectVideoUrls()
   });

@@ -24,6 +24,7 @@ MAX_HEADER_VALUE_LENGTH = 8192
 LOG_BYTES_STEP = 50 * 1024 * 1024
 LOG_PERCENT_STEP = 5
 IDLE_EXIT_SECONDS = int(os.environ.get("MEETING_PARSER_IDLE_SECONDS", str(15 * 60)))
+MAX_FILENAME_STEM_LENGTH = 220  # Keep this aligned with extension/title_utils.js.
 
 ALLOWED_HEADERS = {
     "accept",
@@ -109,14 +110,24 @@ def safe_filename(value: str) -> str:
     """Return a filename confined to the Downloads directory and ending in .mp4."""
     if not isinstance(value, str):
         value = "video.mp4"
-    value = value.replace("/", " ").replace("\\", " ")
-    value = re.sub(r'[<>:"|?*\x00-\x1f]', " ", value)
-    value = re.sub(r"\s+", " ", value).strip().strip(".")
-    if not value:
-        value = "video"
-    if value.lower().endswith(".mp4"):
-        return f"{value[:-4].rstrip()[:175] or 'video'}.mp4"
-    return f"{value[:175]}.mp4"
+    replacements = {
+        "<": "＜",
+        ">": "＞",
+        ":": "：",
+        '"': "＂",
+        "/": "／",
+        "\\": "＼",
+        "|": "｜",
+        "?": "？",
+        "*": "＊",
+    }
+    value = "".join(replacements.get(character, character) for character in value)
+    value = "".join(character for character in value if ord(character) >= 0x20 and ord(character) != 0x7F)
+    value = re.sub(r"\s+", " ", value).strip().rstrip(" .")
+    if value.casefold().endswith(".mp4"):
+        value = value[:-4].rstrip()
+    value = value[:MAX_FILENAME_STEM_LENGTH].rstrip(" .") or "video"
+    return f"{value}.mp4"
 
 
 def filter_request_headers(raw_headers: object) -> dict[str, str]:

@@ -1,3 +1,5 @@
+importScripts("title_utils.js");
+
 const MAX_CANDIDATES_PER_TAB = 80;
 const tabWriteQueue = new Map();
 const requestContexts = new Map();
@@ -530,16 +532,10 @@ chrome.webRequest.onSendHeaders.addListener(
 );
 
 function safeFilenamePart(value) {
-  return value
-    .replace(/[<>:"/\\|?*\u0000-\u001F]/g, " ")
-    .replace(/\s+/g, " ")
-    .trim()
-    .slice(0, 100);
+  return normalizeFilenamePart(value, "");
 }
 
-function filenameForDownload(url, pageTitle) {
-  const title = safeFilenamePart(pageTitle || "media");
-  const fallback = "media";
+function filenameForDownload(url, recordingTitle, pageTitle) {
   let filePart = "";
   try {
     filePart = decodeURIComponent(new URL(url).pathname.split("/").pop() || "");
@@ -547,7 +543,8 @@ function filenameForDownload(url, pageTitle) {
     filePart = "";
   }
   filePart = safeFilenamePart(filePart).replace(/\.mp4$/i, "");
-  return `${title || filePart || fallback}.mp4`;
+  const title = normalizeRecordingTitle(recordingTitle) || normalizeRecordingTitle(pageTitle);
+  return `${safeFilenamePart(title || filePart || "media") || "media"}.mp4`;
 }
 
 async function localDownloaderRequest(path, options = {}) {
@@ -759,7 +756,7 @@ async function prepareCandidateAndStartDownload(message, options = {}) {
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({
       url,
-      filename: message.filename || filenameForDownload(url, message.pageTitle),
+      filename: message.filename || filenameForDownload(url, message.recordingTitle, message.pageTitle),
       headers: localDownloadHeaders(context)
     })
   });
@@ -841,6 +838,7 @@ function persistedBatchTask(task, index) {
     pageUrl: typeof task?.pageUrl === "string" ? task.pageUrl : "",
     status: typeof task?.status === "string" ? task.status : "pending",
     pageTitle: typeof task?.pageTitle === "string" ? task.pageTitle.slice(0, 240) : "",
+    recordingTitle: typeof task?.recordingTitle === "string" ? task.recordingTitle.slice(0, MAX_RECORDING_TITLE_LENGTH) : "",
     filename: typeof task?.filename === "string" ? task.filename.slice(0, 240) : "",
     taskId: typeof task?.taskId === "string" && /^[a-f0-9]{32}$/.test(task.taskId) ? task.taskId : "",
     bytes: Number.isFinite(task?.bytes) ? Math.max(0, Number(task.bytes)) : 0,
@@ -969,8 +967,8 @@ function nextPendingBatchIndex(state) {
 }
 
 function batchFilename(task, candidate) {
-  const pageTitle = safeFilenamePart(task.pageTitle || "");
-  const genericTitle = /^(腾讯会议|会议|回放|当前页面|media)$/i.test(pageTitle);
+  const recordingTitle = normalizeRecordingTitle(task.recordingTitle);
+  const pageTitle = normalizeRecordingTitle(task.pageTitle);
   const mediaName = safeFilenamePart((candidate.mediaFilename || "").replace(/\.mp4$/i, ""));
   let pageId = "meeting";
   try {
@@ -978,7 +976,7 @@ function batchFilename(task, candidate) {
   } catch {
     // The batch parser only accepts valid meeting URLs; keep a safe fallback.
   }
-  const name = !genericTitle && pageTitle ? pageTitle : mediaName || pageId || "meeting";
+  const name = recordingTitle || pageTitle || mediaName || pageId || "meeting";
   return `${String(task.index + 1).padStart(3, "0")} - ${name}.mp4`;
 }
 
@@ -1166,6 +1164,7 @@ async function advanceBatchQueue() {
     await chrome.tabs.sendMessage(workerTabId, { type: "scanPageMedia" }).catch(() => undefined);
     const [candidates, page] = await Promise.all([getCandidates(workerTabId), getPageInfo(workerTabId)]);
     task.pageTitle = page.title || task.pageTitle || "";
+    task.recordingTitle = page.recordingTitle || task.recordingTitle || "";
     const mp4Count = candidates.filter((candidate) => candidate.kind === "mp4").length;
     if (task.lastCandidateLogCount !== mp4Count) {
       task.lastCandidateLogCount = mp4Count;
@@ -1196,6 +1195,7 @@ async function advanceBatchQueue() {
           tabId: workerTabId,
           candidateId: selected.candidate.id,
           contentType: selected.candidate.contentType,
+          recordingTitle: task.recordingTitle,
           pageTitle: task.pageTitle,
           filename: task.filename
         },
@@ -1266,7 +1266,7 @@ async function startBatch(message) {
     status: "starting",
     startedAt: new Date().toISOString(),
     tasks: accepted.map((pageUrl, index) => ({
-      index, pageUrl, status: "pending", pageTitle: "", filename: "", taskId: "", bytes: 0,
+      index, pageUrl, status: "pending", pageTitle: "", recordingTitle: "", filename: "", taskId: "", bytes: 0,
       totalBytes: null, progress: null, error: ""
     }))
   };
@@ -1323,11 +1323,12 @@ async function retryBatchTask(index) {
   return state;
 }
 
-async function notifyBatchMetadata(tabId, pageTitle) {
+async function notifyBatchMetadata(tabId, metadata) {
   const state = await getBatchState();
   const task = batchTask(state);
   if (state.status !== "running" || state.workerTabId !== tabId || !task) return;
-  task.pageTitle = pageTitle || task.pageTitle || "";
+  task.pageTitle = metadata.pageTitle || task.pageTitle || "";
+  task.recordingTitle = metadata.recordingTitle || task.recordingTitle || "";
   if (task.status === "navigating") {
     task.status = "detecting";
     task.phaseStartedAt = Date.now();
@@ -1372,6 +1373,8 @@ async function savePageMetadata(tabId, metadata, senderPageUrl = "", senderDocum
     await setPageInfo(tabId, {
       url: redactedUrl(metadata.pageUrl),
       title: metadata.pageTitle || current.title || "",
+      recordingTitle: metadata.recordingTitle || current.recordingTitle || "",
+      recordingTitleSource: metadata.recordingTitleSource || current.recordingTitleSource || "",
       scope: pageScope,
       generation: boundState.generation,
       updatedAt: new Date().toISOString()
@@ -1392,7 +1395,7 @@ async function savePageMetadata(tabId, metadata, senderPageUrl = "", senderDocum
       });
     }
   }
-  void notifyBatchMetadata(tabId, metadata.pageTitle);
+  void notifyBatchMetadata(tabId, metadata);
 }
 
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
