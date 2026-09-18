@@ -6,7 +6,10 @@ const DOWNLOAD_STATUS_KEY = "downloadStatuses";
 const REQUEST_CONTEXT_TTL_MS = 10 * 60 * 1000;
 const MAX_REQUEST_CONTEXTS = 250;
 const MEDIA_CONTEXT_HEADERS = new Set(["accept", "origin", "referer", "range"]);
+const SENSITIVE_CONTEXT_HEADERS = new Set(["cookie", "authorization"]);
 const DOWNLOAD_RESOURCE_TYPES = ["main_frame", "sub_frame", "xmlhttprequest", "media", "other"];
+const candidateIdsByUrl = new Map();
+const candidateUrlsById = new Map();
 let nextRuleId = Math.max(100000, Date.now() % 1000000000);
 let downloadStatusWrite = Promise.resolve();
 
@@ -34,6 +37,35 @@ function isHttpUrl(value) {
   } catch {
     return false;
   }
+}
+
+function redactedUrl(value) {
+  try {
+    const url = new URL(value);
+    const names = [...new Set([...url.searchParams.keys()])];
+    url.search = names.map((name) => `${encodeURIComponent(name)}=[redacted]`).join("&");
+    url.hash = "";
+    return url.href;
+  } catch {
+    return "[redacted URL]";
+  }
+}
+
+function newCandidateId() {
+  if (globalThis.crypto?.randomUUID) return `media-${crypto.randomUUID()}`;
+  return `media-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+}
+
+function candidateIdForUrl(tabId, url) {
+  const normalized = normalizeUrl(url);
+  const key = requestContextKey(tabId, normalized);
+  let id = candidateIdsByUrl.get(key);
+  if (!id) {
+    id = newCandidateId();
+    candidateIdsByUrl.set(key, id);
+  }
+  candidateUrlsById.set(id, normalized);
+  return id;
 }
 
 function contentTypeFromHeaders(headers = []) {
@@ -72,16 +104,39 @@ function requestContextKey(tabId, url) {
   return `${tabId}:${normalizeUrl(url)}`;
 }
 
-function safeContextHeaders(headers = []) {
+function inspectContextHeaders(headers = []) {
   const selected = {};
+  const sensitive = { cookie: false, authorization: false };
   for (const header of headers) {
     const name = header.name?.toLowerCase();
     const value = header.value;
+    if (SENSITIVE_CONTEXT_HEADERS.has(name)) {
+      sensitive[name] = true;
+      continue;
+    }
     if (!MEDIA_CONTEXT_HEADERS.has(name) || typeof value !== "string") continue;
     if (!value || value.length > 4096 || /[\r\n]/.test(value)) continue;
     selected[name] = value;
   }
-  return selected;
+  return { selected, sensitive };
+}
+
+function contextPresence(context) {
+  return {
+    referer: Boolean(context?.headers?.referer),
+    origin: Boolean(context?.headers?.origin),
+    accept: Boolean(context?.headers?.accept),
+    range: Boolean(context?.headers?.range),
+    cookie: Boolean(context?.sensitive?.cookie),
+    authorization: Boolean(context?.sensitive?.authorization)
+  };
+}
+
+function hasUsableRequestContext(context) {
+  return Boolean(
+    context &&
+      (context.headers.referer || context.headers.origin || context.headers.accept || context.headers.range)
+  );
 }
 
 function pruneRequestContexts() {
@@ -100,8 +155,8 @@ function rememberRequestContext(details) {
   const kind = detectMediaKind(details.url);
   if (!kind && details.type !== "media") return;
 
-  const selected = safeContextHeaders(details.requestHeaders);
-  if (!Object.keys(selected).length) return;
+  const inspected = inspectContextHeaders(details.requestHeaders);
+  if (!Object.keys(inspected.selected).length && !Object.values(inspected.sensitive).some(Boolean)) return;
 
   const key = requestContextKey(details.tabId, details.url);
   const previous = requestContexts.get(key);
@@ -109,10 +164,15 @@ function rememberRequestContext(details) {
     tabId: details.tabId,
     url: normalizeUrl(details.url),
     kind: kind || previous?.kind || "other",
-    headers: { ...(previous?.headers || {}), ...selected },
+    headers: { ...(previous?.headers || {}), ...inspected.selected },
+    sensitive: {
+      ...(previous?.sensitive || {}),
+      ...inspected.sensitive
+    },
     requestId: details.requestId,
     updatedAt: Date.now()
   });
+  void updateCandidateContext(details.tabId, details.url, requestContexts.get(key));
   pruneRequestContexts();
 }
 
@@ -210,7 +270,33 @@ function moreSpecificKind(current, next) {
 
 async function getCandidates(tabId) {
   const result = await chrome.storage.session.get(candidatesKey(tabId));
-  return Array.isArray(result[candidatesKey(tabId)]) ? result[candidatesKey(tabId)] : [];
+  const stored = Array.isArray(result[candidatesKey(tabId)]) ? result[candidatesKey(tabId)] : [];
+  let migrated = false;
+  const candidates = stored.map((candidate) => {
+    if (candidate.id) return candidate;
+    migrated = true;
+    const id = isHttpUrl(candidate.url) ? candidateIdForUrl(tabId, candidate.url) : newCandidateId();
+    return {
+      ...candidate,
+      id,
+      url: redactedUrl(candidate.url),
+      contextReady: false
+    };
+  });
+
+  if (migrated) {
+    await chrome.storage.session.set({ [candidatesKey(tabId)]: candidates });
+  }
+
+  return candidates.map((candidate) => {
+    const actualUrl = candidateUrlsById.get(candidate.id);
+    const context = actualUrl ? getRequestContext(tabId, actualUrl) : undefined;
+    return {
+      ...candidate,
+      context: contextPresence(context) || candidate.context,
+      contextReady: hasUsableRequestContext(context) || Boolean(candidate.contextReady)
+    };
+  });
 }
 
 async function getPageInfo(tabId) {
@@ -233,27 +319,47 @@ function queueTabWrite(tabId, task) {
   });
 }
 
+function updateCandidateContext(tabId, url, context) {
+  const candidateId = candidateIdsByUrl.get(requestContextKey(tabId, url));
+  if (!candidateId) return;
+  return queueTabWrite(tabId, async () => {
+    const candidates = await getCandidates(tabId);
+    const candidate = candidates.find((item) => item.id === candidateId);
+    if (!candidate) return;
+    candidate.context = contextPresence(context);
+    candidate.contextReady = hasUsableRequestContext(context);
+    await chrome.storage.session.set({ [candidatesKey(tabId)]: candidates });
+  });
+}
+
 function upsertCandidate(tabId, incoming) {
   return queueTabWrite(tabId, async () => {
     const candidates = await getCandidates(tabId);
     const now = new Date().toISOString();
     const url = normalizeUrl(incoming.url);
-    const existing = candidates.find((candidate) => candidate.url === url);
+    const id = candidateIdForUrl(tabId, url);
+    const context = getRequestContext(tabId, url);
+    const existing = candidates.find((candidate) => candidate.id === id);
 
     if (existing) {
       existing.kind = moreSpecificKind(existing.kind, incoming.kind);
       existing.contentType = incoming.contentType || existing.contentType || "";
       existing.sources = [...new Set([...(existing.sources || []), incoming.source])];
+      existing.context = contextPresence(context);
+      existing.contextReady = hasUsableRequestContext(context);
       existing.lastSeen = now;
       await chrome.storage.session.set({ [candidatesKey(tabId)]: candidates });
       return existing;
     }
 
     const candidate = {
-      url,
+      id,
+      url: redactedUrl(url),
       kind: incoming.kind || "other",
       contentType: incoming.contentType || "",
       sources: [incoming.source],
+      context: contextPresence(context),
+      contextReady: hasUsableRequestContext(context),
       firstSeen: now,
       lastSeen: now
     };
@@ -294,13 +400,13 @@ chrome.webRequest.onHeadersReceived.addListener(
 chrome.webRequest.onBeforeSendHeaders.addListener(
   (details) => rememberRequestContext(details),
   { urls: ["<all_urls>"] },
-  ["requestHeaders"]
+  ["requestHeaders", "extraHeaders"]
 );
 
 chrome.webRequest.onSendHeaders.addListener(
   (details) => rememberRequestContext(details),
   { urls: ["<all_urls>"] },
-  ["requestHeaders"]
+  ["requestHeaders", "extraHeaders"]
 );
 
 function safeFilenamePart(value) {
@@ -454,12 +560,18 @@ async function reconcileDownload(downloadId) {
 }
 
 async function startMp4Download(message) {
-  const url = message.url;
-  if (!isHttpUrl(url) || detectMediaKind(url, message.contentType) !== "mp4") {
+  const url = candidateUrlsById.get(message.candidateId);
+  if (!url || !Number.isInteger(message.tabId)) {
+    throw new Error("未捕获播放器请求上下文，请重新播放视频后再试。");
+  }
+  if (detectMediaKind(url, message.contentType) !== "mp4") {
     throw new Error("该资源不是可直接下载的 MP4。");
   }
 
-  const context = Number.isInteger(message.tabId) ? getRequestContext(message.tabId, url) : undefined;
+  const context = getRequestContext(message.tabId, url);
+  if (!hasUsableRequestContext(context)) {
+    throw new Error("未捕获播放器请求上下文，请重新播放视频后再试。");
+  }
   const directHeaders = directDownloadHeaders(context);
   const deferredHeaders = deferredDownloadHeaders(context);
   const temporaryRules = await installTemporaryHeaderRules(url, deferredHeaders);
@@ -497,14 +609,14 @@ async function startMp4Download(message) {
 
   return {
     downloadId,
-    warning: temporaryRules.warning || (!context ? "未找到当前 MP4 的原始请求上下文，已直接尝试下载。" : "")
+    warning: temporaryRules.warning || ""
   };
 }
 
 async function savePageMetadata(tabId, metadata) {
   const current = await getPageInfo(tabId);
   await setPageInfo(tabId, {
-    url: metadata.pageUrl,
+    url: redactedUrl(metadata.pageUrl),
     title: metadata.pageTitle || current.title || "",
     updatedAt: new Date().toISOString()
   });

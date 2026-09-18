@@ -23,13 +23,28 @@ function collectVideoUrls() {
   return [...urls];
 }
 
+function sendRuntimeMessage(message) {
+  try {
+    const response = chrome.runtime.sendMessage(message, () => {
+      // Reading lastError prevents Chrome from reporting a rejected message
+      // when this page still has the previous extension context.
+      void chrome.runtime.lastError;
+    });
+    if (response && typeof response.catch === "function") {
+      response.catch(() => undefined);
+    }
+  } catch {
+    // The page can outlive an extension reload. Refreshing the page loads the new context.
+  }
+}
+
 function sendMetadata() {
-  chrome.runtime.sendMessage({
+  sendRuntimeMessage({
     type: "pageMetadata",
     pageUrl: location.href,
     pageTitle: document.title,
     videoUrls: collectVideoUrls()
-  }, () => void chrome.runtime.lastError);
+  });
 }
 
 let timer;

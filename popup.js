@@ -25,6 +25,17 @@ function formatDownloadStatus(status) {
   return `正在下载：${status.filename || "MP4 文件"}`;
 }
 
+function formatContextPresence(context = {}) {
+  const item = (label, present) => `${label} ${present ? "✓" : "—"}`;
+  return [
+    item("Referer", context.referer),
+    item("Origin", context.origin),
+    item("Accept", context.accept),
+    item("Range", context.range),
+    item("Cookie", context.cookie)
+  ].join(" · ");
+}
+
 async function monitorDownload(downloadId) {
   for (let attempt = 0; attempt < 120; attempt += 1) {
     const result = await chrome.runtime.sendMessage({ type: "getDownloadStatus", downloadId });
@@ -55,7 +66,7 @@ function createCandidateCard(candidate, pageTitle, tabId) {
       download.disabled = true;
       const result = await chrome.runtime.sendMessage({
         type: "downloadMp4",
-        url: candidate.url,
+        candidateId: candidate.id,
         contentType: candidate.contentType,
         pageTitle,
         tabId
@@ -79,7 +90,11 @@ function createCandidateCard(candidate, pageTitle, tabId) {
   const source = candidate.sources?.join("、") || "未知来源";
   details.textContent = `${source}${candidate.contentType ? ` · ${candidate.contentType}` : ""}`;
 
-  card.append(heading, url, details);
+  const context = document.createElement("p");
+  context.className = "context-diagnostic";
+  context.textContent = `请求上下文：${formatContextPresence(candidate.context)}`;
+
+  card.append(heading, url, details, context);
   return card;
 }
 
