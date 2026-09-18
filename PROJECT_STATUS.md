@@ -32,6 +32,8 @@
 - 已完成录制标题命名整理：腾讯会议页面优先提取顶部可见标题，单条/批量统一使用 `recordingTitle`
 - 已统一 Windows 文件名安全转换规则，保留中文标点并将文件名主体上限调整为 220 字符
 - 已增加标题提取、非法字符、长标题和 Python 文件名处理的定向测试
+- 已修复 PowerShell 5.1 脚本编码兼容：全部 `.ps1` 统一为 UTF-8 BOM + CRLF，并增加 `.editorconfig`
+- 已验证 Windows PowerShell 5.1 / PowerShell 7 的 Companion 构建、安装和卸载模拟流程
 
 ## 当前
 
@@ -39,6 +41,7 @@
 - 本地 Python 下载器仍保留为开发调试实现；普通用户流程已改为由插件自动启动 Windows Companion
 - Companion 与浏览器 Native Messaging 的完整真实端到端流程尚待在重新加载的 Chrome/Edge 扩展中验证，不能视为“一键体验已真实完成”
 - 本轮文件命名已完成代码级整理，真实腾讯会议页面的最终文件名仍需现场回归确认
+- Companion PowerShell 脚本已具备 Windows PowerShell 5.1 编码兼容性
 
 ## 问题
 
@@ -56,4 +59,4 @@
 - 验证批量运行防休眠、暂停/完成释放，以及浏览器重启后“发现未完成批量任务，点击继续”
 - 完成后再运行完整 67 条列表
 - 在真实腾讯会议页面验证单条与批量标题命名、中文标点、长标题和重名冲突处理
-- 通过回归后提交本轮命名修改并推送 `origin/main`
+- 继续完成真实 Chrome/Edge Companion、批量恢复和下载命名回归

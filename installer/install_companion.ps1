@@ -1,11 +1,15 @@
-[CmdletBinding(SupportsShouldProcess = $true)]
+﻿[CmdletBinding(SupportsShouldProcess = $true)]
 param(
-  [string]$SourceDirectory = (Join-Path (Split-Path -Parent $PSScriptRoot) "dist\companion")
+  [string]$SourceDirectory = ""
 )
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
 . (Join-Path $PSScriptRoot "companion.config.ps1")
+
+if ([string]::IsNullOrWhiteSpace($SourceDirectory)) {
+  $SourceDirectory = Join-Path (Split-Path -Parent $PSScriptRoot) "dist\companion"
+}
 
 $source = Resolve-Path -LiteralPath $SourceDirectory -ErrorAction Stop
 $requiredFiles = @("MeetingParserDownloader.exe", "MeetingParserNativeHost.exe")

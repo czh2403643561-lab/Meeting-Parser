@@ -1,3 +1,3 @@
-$MeetingParserNativeHostName = "com.meetingparser.helper"
+﻿$MeetingParserNativeHostName = "com.meetingparser.helper"
 $MeetingParserExtensionId = "lofgkifcemmmdnacnllpoehcncdoecnm"
 $MeetingParserInstallDirectoryName = "MeetingParser"
