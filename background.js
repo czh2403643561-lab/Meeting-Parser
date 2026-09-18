@@ -1,17 +1,21 @@
 const MAX_CANDIDATES_PER_TAB = 80;
 const tabWriteQueue = new Map();
 const requestContexts = new Map();
-const downloadJobs = new Map();
-const DOWNLOAD_STATUS_KEY = "downloadStatuses";
 const REQUEST_CONTEXT_TTL_MS = 10 * 60 * 1000;
 const MAX_REQUEST_CONTEXTS = 250;
 const MEDIA_CONTEXT_HEADERS = new Set(["accept", "origin", "referer", "range"]);
 const SENSITIVE_CONTEXT_HEADERS = new Set(["cookie", "authorization"]);
-const DOWNLOAD_RESOURCE_TYPES = ["main_frame", "sub_frame", "xmlhttprequest", "media", "other"];
+const LOCAL_FORWARD_HEADERS = new Set([
+  "accept",
+  "accept-language",
+  "authorization",
+  "cookie",
+  "origin",
+  "referer",
+  "user-agent"
+]);
 const candidateIdsByUrl = new Map();
 const candidateUrlsById = new Map();
-let nextRuleId = Math.max(100000, Date.now() % 1000000000);
-let downloadStatusWrite = Promise.resolve();
 
 function candidatesKey(tabId) {
   return `mediaCandidates:${tabId}`;
@@ -112,9 +116,13 @@ function inspectContextHeaders(headers = []) {
     const value = header.value;
     if (SENSITIVE_CONTEXT_HEADERS.has(name)) {
       sensitive[name] = true;
+      if (typeof value === "string" && value && value.length <= 4096 && !/[\r\n]/.test(value)) {
+        selected[name] = value;
+      }
       continue;
     }
-    if (!MEDIA_CONTEXT_HEADERS.has(name) || typeof value !== "string") continue;
+    if (!MEDIA_CONTEXT_HEADERS.has(name) && !LOCAL_FORWARD_HEADERS.has(name)) continue;
+    if (typeof value !== "string") continue;
     if (!value || value.length > 4096 || /[\r\n]/.test(value)) continue;
     selected[name] = value;
   }
@@ -181,86 +189,13 @@ function getRequestContext(tabId, url) {
   return requestContexts.get(requestContextKey(tabId, url));
 }
 
-function directDownloadHeaders(context) {
-  if (!context) return [];
-  const headers = [];
-  if (context.headers.accept) {
-    headers.push({ name: "Accept", value: context.headers.accept });
-  }
-
-  // Do not replay a partial player range. bytes=0- is the only range that can
-  // still describe the complete resource; other ranges would create a partial file.
-  if (/^bytes=0-$/.test(context.headers.range?.trim() || "")) {
-    headers.push({ name: "Range", value: "bytes=0-" });
+function localDownloadHeaders(context) {
+  if (!context) return {};
+  const headers = {};
+  for (const name of LOCAL_FORWARD_HEADERS) {
+    if (context.headers[name]) headers[name] = context.headers[name];
   }
   return headers;
-}
-
-function deferredDownloadHeaders(context) {
-  if (!context) return [];
-  return ["referer", "origin"]
-    .filter((name) => context.headers[name])
-    .map((name) => ({ name, value: context.headers[name] }));
-}
-
-function escapedRegex(value) {
-  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-}
-
-function downloadUrlCondition(url) {
-  const regex = `^${escapedRegex(normalizeUrl(url))}$`;
-  if (regex.length <= 2000) {
-    return { regexFilter: regex, resourceTypes: DOWNLOAD_RESOURCE_TYPES };
-  }
-  return { urlFilter: normalizeUrl(url), resourceTypes: DOWNLOAD_RESOURCE_TYPES };
-}
-
-async function allocateRuleIds(count) {
-  const existing = await chrome.declarativeNetRequest.getSessionRules();
-  const used = new Set(existing.map((rule) => rule.id));
-  const ids = [];
-  while (ids.length < count) {
-    nextRuleId = (nextRuleId % 2000000000) + 1;
-    if (!used.has(nextRuleId)) {
-      used.add(nextRuleId);
-      ids.push(nextRuleId);
-    }
-  }
-  return ids;
-}
-
-async function installTemporaryHeaderRules(url, headers) {
-  if (!headers.length) return { ruleIds: [] };
-  if (!chrome.declarativeNetRequest?.updateSessionRules) {
-    return { ruleIds: [], warning: "浏览器不支持临时请求头规则，已仅使用可直接附带的请求头。" };
-  }
-
-  try {
-    const ruleIds = await allocateRuleIds(headers.length);
-    const condition = downloadUrlCondition(url);
-    const rules = headers.map((header, index) => ({
-      id: ruleIds[index],
-      priority: 1000,
-      action: {
-        type: "modifyHeaders",
-        requestHeaders: [{ header: header.name, operation: "set", value: header.value }]
-      },
-      condition
-    }));
-    await chrome.declarativeNetRequest.updateSessionRules({ addRules: rules });
-    return { ruleIds };
-  } catch (error) {
-    return { ruleIds: [], warning: `临时请求头规则未启用：${error.message}` };
-  }
-}
-
-async function removeTemporaryHeaderRules(ruleIds = []) {
-  if (!ruleIds.length || !chrome.declarativeNetRequest?.updateSessionRules) return;
-  try {
-    await chrome.declarativeNetRequest.updateSessionRules({ removeRuleIds: ruleIds });
-  } catch {
-    // A session rule may already have been removed by extension reload.
-  }
 }
 
 function moreSpecificKind(current, next) {
@@ -430,136 +365,41 @@ function filenameForDownload(url, pageTitle) {
   return `${title || filePart || fallback}.mp4`;
 }
 
-function publicDownloadStatus(status) {
-  if (!status) return null;
-  const { ruleIds, ...publicStatus } = status;
-  return publicStatus;
-}
+const LOCAL_DOWNLOADER_BASE = "http://127.0.0.1:8765";
 
-async function readDownloadStatuses() {
-  const result = await chrome.storage.session.get(DOWNLOAD_STATUS_KEY);
-  return Array.isArray(result[DOWNLOAD_STATUS_KEY]) ? result[DOWNLOAD_STATUS_KEY] : [];
-}
-
-function updateDownloadStatus(downloadId, patch) {
-  const operation = downloadStatusWrite
-    .catch(() => undefined)
-    .then(async () => {
-      const statuses = await readDownloadStatuses();
-      const previous = statuses.find((status) => status.downloadId === downloadId) || { downloadId };
-      const status = {
-        ...previous,
-        ...patch,
-        downloadId,
-        updatedAt: new Date().toISOString()
-      };
-      const nextStatuses = [
-        status,
-        ...statuses.filter((item) => item.downloadId !== downloadId)
-      ].slice(0, 20);
-      await chrome.storage.session.set({ [DOWNLOAD_STATUS_KEY]: nextStatuses });
-      void chrome.runtime.sendMessage({
-        type: "downloadStatus",
-        status: publicDownloadStatus(status)
-      }).catch(() => undefined);
-      return status;
-    });
-  downloadStatusWrite = operation;
-  return operation;
-}
-
-async function getStoredDownloadStatus(downloadId) {
-  const statuses = await readDownloadStatuses();
-  return statuses.find((status) => status.downloadId === downloadId);
-}
-
-function downloadErrorText(errorCode) {
-  const messages = {
-    FILE_FAILED: "本地文件写入失败。",
-    FILE_ACCESS_DENIED: "没有权限写入目标文件。",
-    FILE_NO_SPACE: "磁盘空间不足。",
-    FILE_NAME_TOO_LONG: "文件名过长。",
-    NETWORK_FAILED: "网络请求失败。",
-    NETWORK_TIMEOUT: "网络请求超时。",
-    NETWORK_DISCONNECTED: "网络连接中断。",
-    NETWORK_SERVER_DOWN: "服务器不可用。",
-    SERVER_FAILED: "服务器返回失败。",
-    SERVER_NO_RANGE: "服务器不支持所需的范围请求。",
-    SERVER_BAD_CONTENT: "服务器返回的内容不是有效的媒体文件，可能是错误文本或鉴权失败。",
-    SERVER_UNAUTHORIZED: "服务器拒绝访问，可能需要在原页面保持登录。",
-    SERVER_FORBIDDEN: "服务器禁止下载该资源。",
-    SERVER_UNREACHABLE: "无法连接到媒体服务器。",
-    SERVER_MALFORMED: "服务器响应格式异常。",
-    USER_CANCELED: "下载已取消。",
-    USER_SHUTDOWN: "浏览器关闭导致下载中断。",
-    BLOCKED_TOO_MANY_DOWNLOADS: "浏览器阻止了过多下载。"
-  };
-  return `${messages[errorCode] || "下载失败。"}${errorCode ? `（${errorCode}）` : ""}`;
-}
-
-function acceptedMp4Mime(mime) {
-  const normalized = mime?.split(";", 1)[0].trim().toLowerCase();
-  return !normalized || ["video/mp4", "application/mp4", "application/octet-stream"].includes(normalized);
-}
-
-async function cleanupDownload(downloadId, status) {
-  const job = downloadJobs.get(downloadId);
-  const ruleIds = job?.ruleIds || status?.ruleIds || [];
-  await removeTemporaryHeaderRules(ruleIds);
-  if (job?.contextKey) requestContexts.delete(job.contextKey);
-  downloadJobs.delete(downloadId);
-  if (ruleIds.length) {
-    await updateDownloadStatus(downloadId, { ruleIds: [] });
-  }
-}
-
-async function handleDownloadChanged(downloadId, delta) {
-  const stored = await getStoredDownloadStatus(downloadId);
-  if (!stored) return;
-
-  const nextState = delta.state?.current || stored.state;
-  const errorCode = delta.error?.current || stored.errorCode;
-  const terminal = nextState === "complete" || nextState === "interrupted" || Boolean(errorCode);
-  if (!terminal) {
-    if (delta.state?.current) await updateDownloadStatus(downloadId, { state: nextState });
-    return;
-  }
-
-  let patch = { state: nextState, errorCode };
-  if (errorCode || nextState === "interrupted") {
-    patch.error = downloadErrorText(errorCode);
-    patch.state = "interrupted";
-  } else {
-    const items = await chrome.downloads.search({ id: downloadId });
-    const item = items[0];
-    if (item?.mime && !acceptedMp4Mime(item.mime)) {
-      patch.state = "interrupted";
-      patch.errorCode = "SERVER_BAD_CONTENT";
-      patch.error = `服务器返回类型为 ${item.mime}，未确认是 MP4；未将其视为成功下载。`;
-    } else {
-      patch.error = "";
-    }
-  }
-
-  const finalStatus = await updateDownloadStatus(downloadId, patch);
-  await cleanupDownload(downloadId, finalStatus);
-}
-
-async function reconcileDownload(downloadId) {
+async function localDownloaderRequest(path, options = {}) {
+  let response;
   try {
-    const items = await chrome.downloads.search({ id: downloadId });
-    const item = items[0];
-    if (!item || !["complete", "interrupted"].includes(item.state)) return;
-    await handleDownloadChanged(downloadId, {
-      state: { current: item.state },
-      error: item.error ? { current: item.error } : undefined
+    response = await fetch(`${LOCAL_DOWNLOADER_BASE}${path}`, {
+      cache: "no-store",
+      ...options
     });
   } catch {
-    // The normal onChanged event will report the result if reconciliation races it.
+    throw new Error("本地下载器未启动，请先运行 local_downloader.py");
+  }
+
+  let body = {};
+  try {
+    body = await response.json();
+  } catch {
+    body = {};
+  }
+  if (!response.ok) {
+    throw new Error(body.error || `本地下载器返回 HTTP ${response.status}。`);
+  }
+  return body;
+}
+
+async function checkLocalDownloader() {
+  try {
+    const result = await localDownloaderRequest("/health");
+    return { ok: result.ok === true };
+  } catch (error) {
+    return { ok: false, error: error.message };
   }
 }
 
-async function startMp4Download(message) {
+async function startLocalDownload(message) {
   const url = candidateUrlsById.get(message.candidateId);
   if (!url || !Number.isInteger(message.tabId)) {
     throw new Error("未捕获播放器请求上下文，请重新播放视频后再试。");
@@ -572,45 +412,25 @@ async function startMp4Download(message) {
   if (!hasUsableRequestContext(context)) {
     throw new Error("未捕获播放器请求上下文，请重新播放视频后再试。");
   }
-  const directHeaders = directDownloadHeaders(context);
-  const deferredHeaders = deferredDownloadHeaders(context);
-  const temporaryRules = await installTemporaryHeaderRules(url, deferredHeaders);
-  const filename = filenameForDownload(url, message.pageTitle);
-  const options = {
-    url,
-    filename,
-    saveAs: true,
-    conflictAction: "uniquify"
-  };
-  if (directHeaders.length) options.headers = directHeaders;
 
-  let downloadId;
-  try {
-    downloadId = await chrome.downloads.download(options);
-  } catch (error) {
-    await removeTemporaryHeaderRules(temporaryRules.ruleIds);
-    throw new Error(error.message || "浏览器未能启动下载。");
+  await localDownloaderRequest("/health");
+  const result = await localDownloaderRequest("/download", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      url,
+      filename: filenameForDownload(url, message.pageTitle),
+      headers: localDownloadHeaders(context)
+    })
+  });
+  return { taskId: result.taskId, filename: result.filename, status: result.status };
+}
+
+async function getLocalDownloadStatus(taskId) {
+  if (typeof taskId !== "string" || !/^[a-f0-9]{32}$/.test(taskId)) {
+    throw new Error("本地下载任务编号无效。");
   }
-
-  const contextKey = context ? requestContextKey(context.tabId, context.url) : undefined;
-  downloadJobs.set(downloadId, {
-    ruleIds: temporaryRules.ruleIds,
-    contextKey
-  });
-  await updateDownloadStatus(downloadId, {
-    state: "in_progress",
-    filename,
-    error: "",
-    errorCode: "",
-    ruleIds: temporaryRules.ruleIds,
-    startedAt: new Date().toISOString()
-  });
-  void reconcileDownload(downloadId);
-
-  return {
-    downloadId,
-    warning: temporaryRules.warning || ""
-  };
+  return localDownloaderRequest(`/status?id=${encodeURIComponent(taskId)}`);
 }
 
 async function savePageMetadata(tabId, metadata) {
@@ -643,30 +463,26 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     return true;
   }
 
-  if (message?.type === "getDownloadStatus" && Number.isInteger(message.downloadId)) {
-    getStoredDownloadStatus(message.downloadId)
-      .then((status) => sendResponse({ status: publicDownloadStatus(status) }))
+  if (message?.type === "checkLocalDownloader") {
+    checkLocalDownloader()
+      .then((status) => sendResponse(status))
       .catch((error) => sendResponse({ error: error.message }));
     return true;
   }
 
-  if (message?.type === "getLatestDownloadStatus") {
-    readDownloadStatuses()
-      .then((statuses) => sendResponse({ status: publicDownloadStatus(statuses[0]) }))
+  if (message?.type === "getLocalDownloadStatus") {
+    getLocalDownloadStatus(message.taskId)
+      .then((status) => sendResponse(status))
       .catch((error) => sendResponse({ error: error.message }));
     return true;
   }
 
   if (message?.type === "downloadMp4") {
-    startMp4Download(message)
+    startLocalDownload(message)
       .then((result) => sendResponse(result))
       .catch((error) => sendResponse({ error: error.message }));
     return true;
   }
-});
-
-chrome.downloads.onChanged.addListener((delta) => {
-  if (delta.id >= 0) void handleDownloadChanged(delta.id, delta);
 });
 
 chrome.tabs.onUpdated.addListener((tabId, changeInfo) => {

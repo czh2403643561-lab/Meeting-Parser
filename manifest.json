@@ -1,10 +1,10 @@
 {
   "manifest_version": 3,
   "name": "Media Resource Finder",
-  "version": "0.1.1",
-  "description": "Detect media requests from the current page and download direct MP4 files.",
-  "permissions": ["activeTab", "declarativeNetRequestWithHostAccess", "downloads", "storage", "webRequest"],
-  "host_permissions": ["<all_urls>"],
+  "version": "0.2.0",
+  "description": "Detect media requests and send direct MP4 downloads to the local downloader.",
+  "permissions": ["activeTab", "storage", "webRequest"],
+  "host_permissions": ["<all_urls>", "http://127.0.0.1:8765/*"],
   "background": {
     "service_worker": "background.js"
   },
