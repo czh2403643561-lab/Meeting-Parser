@@ -9,6 +9,10 @@ $ErrorActionPreference = "Stop"
 $projectRoot = Split-Path -Parent $PSScriptRoot
 $workRoot = Join-Path $projectRoot ".build\pyinstaller"
 $distRoot = Join-Path $projectRoot "dist\companion"
+$pythonArguments = @()
+if ($Python -match '(^|[\\/])py(?:\.exe)?$') {
+  $pythonArguments = @("-3")
+}
 
 function Build-CompanionExecutable {
   param(
@@ -16,14 +20,14 @@ function Build-CompanionExecutable {
     [Parameter(Mandatory = $true)][string]$Source
   )
 
-  & $Python -3 -m PyInstaller --noconfirm --clean --onefile --windowed --name $Name `
+  & $Python @pythonArguments -m PyInstaller --noconfirm --clean --onefile --windowed --name $Name `
     --paths $projectRoot --distpath $distRoot --workpath $workRoot --specpath $workRoot $Source
   if ($LASTEXITCODE -ne 0) {
     throw "打包失败：$Name"
   }
 }
 
-& $Python -3 -m PyInstaller --version
+& $Python @pythonArguments -m PyInstaller --version
 if ($LASTEXITCODE -ne 0) {
   throw "未找到 PyInstaller。开发环境请运行：py -3 -m pip install -r requirements-dev.txt"
 }
