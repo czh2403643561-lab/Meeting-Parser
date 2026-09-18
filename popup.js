@@ -18,7 +18,26 @@ function showStatus(message) {
   statusElement.textContent = message;
 }
 
-function createCandidateCard(candidate, pageTitle) {
+function formatDownloadStatus(status) {
+  if (!status) return "";
+  if (status.state === "complete") return `下载完成：${status.filename || "MP4 文件"}`;
+  if (status.state === "interrupted") return `下载失败：${status.error || "浏览器中断了下载。"}`;
+  return `正在下载：${status.filename || "MP4 文件"}`;
+}
+
+async function monitorDownload(downloadId) {
+  for (let attempt = 0; attempt < 120; attempt += 1) {
+    const result = await chrome.runtime.sendMessage({ type: "getDownloadStatus", downloadId });
+    if (result?.status) {
+      showStatus(formatDownloadStatus(result.status));
+      if (["complete", "interrupted"].includes(result.status.state)) return;
+    }
+    await new Promise((resolve) => setTimeout(resolve, 500));
+  }
+  showStatus("下载仍在进行，稍后点击刷新可查看最终结果。");
+}
+
+function createCandidateCard(candidate, pageTitle, tabId) {
   const card = document.createElement("article");
   card.className = "candidate";
 
@@ -38,9 +57,15 @@ function createCandidateCard(candidate, pageTitle) {
         type: "downloadMp4",
         url: candidate.url,
         contentType: candidate.contentType,
-        pageTitle
+        pageTitle,
+        tabId
       });
-      showStatus(result?.error ? `下载未启动：${result.error}` : "已交给浏览器下载。");
+      if (result?.error) {
+        showStatus(`下载未启动：${result.error}`);
+      } else {
+        showStatus(result?.warning || "下载已启动，正在等待浏览器结果…");
+        void monitorDownload(result.downloadId);
+      }
       download.disabled = false;
     });
     heading.append(download);
@@ -58,7 +83,7 @@ function createCandidateCard(candidate, pageTitle) {
   return card;
 }
 
-function renderCandidates(candidates, pageTitle) {
+function renderCandidates(candidates, pageTitle, tabId) {
   candidatesElement.replaceChildren();
   if (!candidates.length) {
     const empty = document.createElement("p");
@@ -68,7 +93,7 @@ function renderCandidates(candidates, pageTitle) {
     return;
   }
   for (const candidate of candidates) {
-    candidatesElement.append(createCandidateCard(candidate, pageTitle));
+    candidatesElement.append(createCandidateCard(candidate, pageTitle, tabId));
   }
 }
 
@@ -86,11 +111,17 @@ async function refresh() {
     if (result?.error) throw new Error(result.error);
     const pageTitle = result.page?.title || tab.title || "当前页面";
     pageTitleElement.textContent = pageTitle;
-    renderCandidates(result.candidates || [], pageTitle);
-    showStatus(result.candidates?.length ? `已找到 ${result.candidates.length} 个候选资源。` : "未发现可识别的媒体请求。");
+    renderCandidates(result.candidates || [], pageTitle, tab.id);
+    const latest = await chrome.runtime.sendMessage({ type: "getLatestDownloadStatus" });
+    const latestTime = latest?.status?.updatedAt ? Date.parse(latest.status.updatedAt) : 0;
+    if (latest?.status && Date.now() - latestTime < 10 * 60 * 1000) {
+      showStatus(formatDownloadStatus(latest.status));
+    } else {
+      showStatus(result.candidates?.length ? `已找到 ${result.candidates.length} 个候选资源。` : "未发现可识别的媒体请求。");
+    }
   } catch (error) {
     pageTitleElement.textContent = "当前页面不可读取";
-    renderCandidates([], "");
+    renderCandidates([], "", null);
     showStatus(error.message || "读取失败。");
   } finally {
     refreshButton.disabled = false;
@@ -98,4 +129,9 @@ async function refresh() {
 }
 
 refreshButton.addEventListener("click", refresh);
+chrome.runtime.onMessage.addListener((message) => {
+  if (message?.type === "downloadStatus") {
+    showStatus(formatDownloadStatus(message.status));
+  }
+});
 void refresh();
