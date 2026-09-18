@@ -13,6 +13,27 @@ main {
   padding: 14px;
 }
 
+.mode-tabs {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 4px;
+  margin-bottom: 12px;
+  padding: 3px;
+  border-radius: 8px;
+  background: #e9edf5;
+}
+
+.mode-tab {
+  color: #475467;
+  background: transparent;
+}
+
+.mode-tab.active {
+  color: #172033;
+  background: #fff;
+  box-shadow: 0 1px 3px rgb(16 24 40 / 12%);
+}
+
 header,
 .candidate-heading,
 .download-heading {
@@ -66,6 +87,69 @@ button:disabled {
   font-size: 11px;
 }
 
+.batch-note {
+  margin: 7px 0 12px;
+  color: #667085;
+  font-size: 12px;
+}
+
+.file-picker {
+  display: inline-block;
+  margin-bottom: 8px;
+  padding: 7px 10px;
+  border-radius: 6px;
+  color: #fff;
+  background: #276ef1;
+  cursor: pointer;
+}
+
+.file-picker input {
+  display: none;
+}
+
+textarea {
+  display: block;
+  box-sizing: border-box;
+  width: 100%;
+  margin-bottom: 8px;
+  padding: 8px;
+  border: 1px solid #d0d5dd;
+  border-radius: 6px;
+  color: #172033;
+  background: #fff;
+  font: 12px/1.45 ui-monospace, SFMono-Regular, Consolas, monospace;
+  resize: vertical;
+}
+
+.batch-summary {
+  margin-top: 12px;
+  color: #475467;
+  font-size: 12px;
+}
+
+.batch-list {
+  margin: 8px 0 12px;
+  padding-left: 24px;
+}
+
+.batch-list li {
+  margin: 6px 0;
+  overflow-wrap: anywhere;
+  color: #344054;
+  font-size: 12px;
+}
+
+.batch-list small {
+  display: block;
+  color: #667085;
+}
+
+.disabled-action {
+  color: #667085;
+  background: #eaecf0;
+  cursor: not-allowed;
+}
+
 .download-area,
 .candidate,
 .empty {
@@ -99,6 +183,14 @@ code {
   overflow-wrap: anywhere;
   color: #344054;
   font: 11px/1.4 ui-monospace, SFMono-Regular, Consolas, monospace;
+}
+
+.media-filename {
+  display: block;
+  margin-top: 8px;
+  overflow-wrap: anywhere;
+  color: #172033;
+  font-size: 12px;
 }
 
 .empty {

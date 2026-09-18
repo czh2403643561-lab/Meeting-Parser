@@ -7,12 +7,28 @@ const downloadStatusElement = document.querySelector("#download-status");
 const downloadProgress = document.querySelector("#download-progress");
 const downloadSizeElement = document.querySelector("#download-size");
 const clearDownloadButton = document.querySelector("#clear-download");
+const singleTab = document.querySelector("#single-tab");
+const batchTab = document.querySelector("#batch-tab");
+const singleView = document.querySelector("#single-view");
+const batchView = document.querySelector("#batch-view");
+const batchFile = document.querySelector("#batch-file");
+const batchLinks = document.querySelector("#batch-links");
+const parseBatchButton = document.querySelector("#parse-batch");
+const batchSummary = document.querySelector("#batch-summary");
+const batchList = document.querySelector("#batch-list");
+
+const BATCH_TASKS_KEY = "batchMeetingTasks";
 
 const labels = {
   mp4: "MP4",
   hls: "HLS · m3u8",
   dash: "DASH · mpd",
   other: "其他媒体"
+};
+const variantLabels = {
+  screen: "屏幕画面",
+  speaker: "发言人画面",
+  other: "录制视频"
 };
 
 let activeDownload = null;
@@ -25,6 +41,107 @@ function activeTab() {
 
 function showStatus(message) {
   statusElement.textContent = message;
+}
+
+function setMode(mode) {
+  const batch = mode === "batch";
+  singleView.hidden = batch;
+  batchView.hidden = !batch;
+  singleTab.classList.toggle("active", !batch);
+  batchTab.classList.toggle("active", batch);
+  singleTab.setAttribute("aria-selected", String(!batch));
+  batchTab.setAttribute("aria-selected", String(batch));
+}
+
+function truncateUrl(value, maxLength = 72) {
+  return value.length <= maxLength ? value : `${value.slice(0, maxLength - 1)}…`;
+}
+
+function extractBatchUrlTokens(line) {
+  return (line.match(/https?:\/\/[^\s<>"']+/gi) || []).map((value) =>
+    value.replace(/[),.;!?，。；！？）】]+$/g, "")
+  );
+}
+
+function acceptedBatchUrl(value) {
+  try {
+    const url = new URL(value);
+    return (
+      ["http:", "https:"].includes(url.protocol) &&
+      url.hostname.toLowerCase() === "meeting.tencent.com" &&
+      (url.pathname.startsWith("/crm/") || url.pathname.startsWith("/cw/"))
+    );
+  } catch {
+    return false;
+  }
+}
+
+function parseBatchLinks(text) {
+  const items = [];
+  const seen = new Set();
+  let duplicateCount = 0;
+  let invalidCount = 0;
+
+  for (const line of text.split(/\r?\n/)) {
+    const tokens = extractBatchUrlTokens(line.trim());
+    if (!tokens.length) {
+      if (line.trim()) invalidCount += 1;
+      continue;
+    }
+    for (const value of tokens) {
+      if (!acceptedBatchUrl(value)) {
+        invalidCount += 1;
+        continue;
+      }
+      if (seen.has(value)) {
+        duplicateCount += 1;
+        continue;
+      }
+      seen.add(value);
+      items.push({ url: value, status: "待处理" });
+    }
+  }
+
+  return { items, duplicateCount, invalidCount };
+}
+
+function renderBatchItems(items) {
+  batchList.replaceChildren();
+  for (const [index, item] of items.entries()) {
+    const row = document.createElement("li");
+    row.textContent = `${index + 1}. ${truncateUrl(item.url)}`;
+    row.title = item.url;
+    const state = document.createElement("small");
+    state.textContent = item.status || "待处理";
+    row.append(state);
+    batchList.append(row);
+  }
+}
+
+function renderBatchSummary(result) {
+  batchSummary.textContent = `已识别 ${result.items.length} 条 · 重复 ${result.duplicateCount} 条 · 无效 ${result.invalidCount} 条`;
+  renderBatchItems(result.items);
+}
+
+async function saveBatchResult(result) {
+  await chrome.storage.session.set({
+    [BATCH_TASKS_KEY]: {
+      items: result.items,
+      duplicateCount: result.duplicateCount,
+      invalidCount: result.invalidCount
+    }
+  });
+}
+
+async function restoreBatchResult() {
+  const result = await chrome.storage.session.get(BATCH_TASKS_KEY);
+  const saved = result[BATCH_TASKS_KEY];
+  if (!saved || !Array.isArray(saved.items)) return;
+  renderBatchSummary({
+    items: saved.items,
+    duplicateCount: Number(saved.duplicateCount) || 0,
+    invalidCount: Number(saved.invalidCount) || 0
+  });
 }
 
 function formatBytes(value) {
@@ -110,7 +227,12 @@ function monitorLocalDownload(taskId) {
 
   const poll = async () => {
     if (token !== monitorToken) return;
-    const result = await chrome.runtime.sendMessage({ type: "getLocalDownloadStatus", taskId });
+    let result;
+    try {
+      result = await chrome.runtime.sendMessage({ type: "getLocalDownloadStatus", taskId });
+    } catch {
+      result = { error: "service-unavailable" };
+    }
     if (token !== monitorToken) return;
 
     if (result?.error) {
@@ -146,7 +268,9 @@ function createCandidateCard(candidate, pageTitle, tabId) {
   const heading = document.createElement("div");
   heading.className = "candidate-heading";
   const type = document.createElement("strong");
-  type.textContent = labels[candidate.kind] || labels.other;
+  const mediaLabel = labels[candidate.kind] || labels.other;
+  const variantLabel = candidate.kind === "mp4" ? variantLabels[candidate.variant] || variantLabels.other : "";
+  type.textContent = variantLabel ? `${mediaLabel} · ${variantLabel}` : mediaLabel;
   heading.append(type);
 
   if (candidate.kind === "mp4") {
@@ -210,6 +334,11 @@ function createCandidateCard(candidate, pageTitle, tabId) {
     heading.append(download);
   }
 
+  const filename = document.createElement("strong");
+  filename.className = "media-filename";
+  filename.textContent = candidate.mediaFilename || candidate.url;
+  filename.title = candidate.mediaFilename || candidate.url;
+
   const url = document.createElement("code");
   url.textContent = candidate.url;
   url.title = candidate.url;
@@ -222,7 +351,7 @@ function createCandidateCard(candidate, pageTitle, tabId) {
   context.className = "context-diagnostic";
   context.textContent = `请求上下文：${formatContextPresence(candidate.context)}`;
 
-  card.append(heading, url, details, context);
+  card.append(heading, filename, url, details, context);
   return card;
 }
 
@@ -274,5 +403,34 @@ clearDownloadButton.addEventListener("click", async () => {
   showStatus("已清除下载记录；不会中止本地下载。");
 });
 
+singleTab.addEventListener("click", () => setMode("single"));
+batchTab.addEventListener("click", () => setMode("batch"));
+
+batchFile.addEventListener("change", async () => {
+  const file = batchFile.files?.[0];
+  if (!file) return;
+  try {
+    batchLinks.value = await file.text();
+    batchSummary.textContent = "TXT 已载入，请点击“解析链接”。";
+  } catch {
+    batchSummary.textContent = "TXT 读取失败，请确认文件是 UTF-8 文本。";
+  }
+});
+
+parseBatchButton.addEventListener("click", async () => {
+  const result = parseBatchLinks(batchLinks.value);
+  renderBatchSummary(result);
+  await saveBatchResult(result);
+});
+
+chrome.runtime.onMessage.addListener((message) => {
+  if (message?.type === "pageScopeChanged") {
+    void activeTab().then((tab) => {
+      if (tab?.id === message.tabId) void refresh();
+    });
+  }
+});
+
 refreshButton.addEventListener("click", refresh);
+void restoreBatchResult();
 void refresh();

@@ -17,6 +17,7 @@ const LOCAL_FORWARD_HEADERS = new Set([
 const ACTIVE_DOWNLOAD_KEY = "activeDownload";
 const candidateIdsByUrl = new Map();
 const candidateUrlsById = new Map();
+const tabPageStates = new Map();
 
 if (chrome.sidePanel?.setPanelBehavior) {
   void chrome.sidePanel.setPanelBehavior({ openPanelOnActionClick: true });
@@ -28,6 +29,72 @@ function candidatesKey(tabId) {
 
 function pageKey(tabId) {
   return `mediaPage:${tabId}`;
+}
+
+function pageScopeFromUrl(value) {
+  try {
+    const url = new URL(value);
+    return `${url.origin}${url.pathname}`;
+  } catch {
+    return "";
+  }
+}
+
+function isCurrentPage(tabId, pageScope, generation) {
+  const state = tabPageStates.get(tabId);
+  return Boolean(state && state.scope === pageScope && state.generation === generation);
+}
+
+function clearTabMemory(tabId) {
+  const prefix = `${tabId}:`;
+  for (const [key, candidateId] of candidateIdsByUrl) {
+    if (key.startsWith(prefix)) {
+      candidateIdsByUrl.delete(key);
+      candidateUrlsById.delete(candidateId);
+    }
+  }
+  for (const [key, context] of requestContexts) {
+    if (context.tabId === tabId) requestContexts.delete(key);
+  }
+}
+
+async function initializeTabPageState(tabId) {
+  const existing = tabPageStates.get(tabId);
+  if (existing) return existing;
+  const page = await getPageInfo(tabId);
+  const state = {
+    scope: typeof page.scope === "string" ? page.scope : "",
+    generation: Number.isInteger(page.generation) ? page.generation : 0
+  };
+  tabPageStates.set(tabId, state);
+  return state;
+}
+
+async function activatePageScope(tabId, pageScope) {
+  if (typeof pageScope !== "string") return null;
+  const previous = await initializeTabPageState(tabId);
+  if (previous.scope === pageScope) return previous;
+
+  const next = { scope: pageScope, generation: previous.generation + 1 };
+  tabPageStates.set(tabId, next);
+  clearTabMemory(tabId);
+  void chrome.runtime.sendMessage({ type: "pageScopeChanged", tabId }).catch(() => undefined);
+  void queueTabWrite(tabId, async () => {
+    if (!isCurrentPage(tabId, pageScope, next.generation)) return;
+    await chrome.storage.session.remove([candidatesKey(tabId), pageKey(tabId)]);
+    if (!isCurrentPage(tabId, pageScope, next.generation)) return;
+    await chrome.storage.session.set({
+      [pageKey(tabId)]: { scope: pageScope, generation: next.generation }
+    });
+  });
+  return next;
+}
+
+async function pageStateForRequest(tabId, pageScope) {
+  if (!pageScope) return null;
+  const current = await initializeTabPageState(tabId);
+  if (current.scope && current.scope !== pageScope) return null;
+  return current.scope === pageScope ? current : activatePageScope(tabId, pageScope);
 }
 
 function normalizeUrl(value) {
@@ -109,6 +176,30 @@ function detectMediaKind(url, contentType = "") {
   return "";
 }
 
+function mediaFilenameFromUrl(url) {
+  try {
+    const pathname = new URL(url).pathname;
+    const value = decodeURIComponent(pathname.split("/").pop() || "");
+    return value.replace(/[\r\n]/g, "").slice(0, 180);
+  } catch {
+    return "";
+  }
+}
+
+function mediaVariantFromFilename(filename) {
+  if (/(?:^|[_-])screen\.mp4$/i.test(filename)) return "screen";
+  if (/(?:^|[_-])speaker\.mp4$/i.test(filename)) return "speaker";
+  return "other";
+}
+
+function mediaDetails(url) {
+  const mediaFilename = mediaFilenameFromUrl(url);
+  return {
+    mediaFilename,
+    variant: mediaVariantFromFilename(mediaFilename)
+  };
+}
+
 function requestContextKey(tabId, url) {
   return `${tabId}:${normalizeUrl(url)}`;
 }
@@ -163,10 +254,22 @@ function pruneRequestContexts() {
   }
 }
 
-function rememberRequestContext(details) {
+function pageScopeForRequest(details) {
+  return (
+    pageScopeFromUrl(details.documentUrl) ||
+    pageScopeFromUrl(details.initiator) ||
+    tabPageStates.get(details.tabId)?.scope ||
+    ""
+  );
+}
+
+async function rememberRequestContext(details) {
   if (details.tabId < 0 || !isHttpUrl(details.url)) return;
   const kind = detectMediaKind(details.url);
   if (!kind && details.type !== "media") return;
+  const pageScope = pageScopeForRequest(details);
+  const state = await pageStateForRequest(details.tabId, pageScope);
+  if (!state || !isCurrentPage(details.tabId, pageScope, state.generation)) return;
 
   const inspected = inspectContextHeaders(details.requestHeaders);
   if (!Object.keys(inspected.selected).length && !Object.values(inspected.sensitive).some(Boolean)) return;
@@ -183,9 +286,11 @@ function rememberRequestContext(details) {
       ...inspected.sensitive
     },
     requestId: details.requestId,
+    pageScope,
+    generation: state.generation,
     updatedAt: Date.now()
   });
-  void updateCandidateContext(details.tabId, details.url, requestContexts.get(key));
+  void updateCandidateContext(details.tabId, details.url, pageScope, state.generation, requestContexts.get(key));
   pruneRequestContexts();
 }
 
@@ -209,8 +314,11 @@ function moreSpecificKind(current, next) {
 }
 
 async function getCandidates(tabId) {
+  const state = await initializeTabPageState(tabId);
   const result = await chrome.storage.session.get(candidatesKey(tabId));
-  const stored = Array.isArray(result[candidatesKey(tabId)]) ? result[candidatesKey(tabId)] : [];
+  const stored = Array.isArray(result[candidatesKey(tabId)])
+    ? result[candidatesKey(tabId)].filter((candidate) => candidate.pageScope === state.scope)
+    : [];
   let migrated = false;
   const candidates = stored.map((candidate) => {
     if (candidate.id) return candidate;
@@ -220,6 +328,7 @@ async function getCandidates(tabId) {
       ...candidate,
       id,
       url: redactedUrl(candidate.url),
+      pageScope: state.scope,
       contextReady: false
     };
   });
@@ -259,11 +368,13 @@ function queueTabWrite(tabId, task) {
   });
 }
 
-function updateCandidateContext(tabId, url, context) {
+function updateCandidateContext(tabId, url, pageScope, generation, context) {
   const candidateId = candidateIdsByUrl.get(requestContextKey(tabId, url));
   if (!candidateId) return;
   return queueTabWrite(tabId, async () => {
+    if (!isCurrentPage(tabId, pageScope, generation)) return;
     const candidates = await getCandidates(tabId);
+    if (!isCurrentPage(tabId, pageScope, generation)) return;
     const candidate = candidates.find((item) => item.id === candidateId);
     if (!candidate) return;
     candidate.context = contextPresence(context);
@@ -273,12 +384,21 @@ function updateCandidateContext(tabId, url, context) {
 }
 
 function upsertCandidate(tabId, incoming) {
+  const pageScope = incoming.pageScope || tabPageStates.get(tabId)?.scope || "";
+  const generation = Number.isInteger(incoming.generation)
+    ? incoming.generation
+    : tabPageStates.get(tabId)?.generation;
+  if (!pageScope || !Number.isInteger(generation)) return Promise.resolve();
+
   return queueTabWrite(tabId, async () => {
+    if (!isCurrentPage(tabId, pageScope, generation)) return;
     const candidates = await getCandidates(tabId);
+    if (!isCurrentPage(tabId, pageScope, generation)) return;
     const now = new Date().toISOString();
     const url = normalizeUrl(incoming.url);
     const id = candidateIdForUrl(tabId, url);
     const context = getRequestContext(tabId, url);
+    const details = mediaDetails(url);
     const existing = candidates.find((candidate) => candidate.id === id);
 
     if (existing) {
@@ -287,7 +407,11 @@ function upsertCandidate(tabId, incoming) {
       existing.sources = [...new Set([...(existing.sources || []), incoming.source])];
       existing.context = contextPresence(context);
       existing.contextReady = hasUsableRequestContext(context);
+      existing.mediaFilename = details.mediaFilename || existing.mediaFilename || "";
+      existing.variant = details.variant || existing.variant || "other";
+      existing.pageScope = pageScope;
       existing.lastSeen = now;
+      if (!isCurrentPage(tabId, pageScope, generation)) return;
       await chrome.storage.session.set({ [candidatesKey(tabId)]: candidates });
       return existing;
     }
@@ -297,6 +421,9 @@ function upsertCandidate(tabId, incoming) {
       url: redactedUrl(url),
       kind: incoming.kind || "other",
       contentType: incoming.contentType || "",
+      mediaFilename: details.mediaFilename,
+      variant: details.variant,
+      pageScope,
       sources: [incoming.source],
       context: contextPresence(context),
       contextReady: hasUsableRequestContext(context),
@@ -304,6 +431,7 @@ function upsertCandidate(tabId, incoming) {
       lastSeen: now
     };
     candidates.unshift(candidate);
+    if (!isCurrentPage(tabId, pageScope, generation)) return;
     await chrome.storage.session.set({
       [candidatesKey(tabId)]: candidates.slice(0, MAX_CANDIDATES_PER_TAB)
     });
@@ -311,18 +439,23 @@ function upsertCandidate(tabId, incoming) {
   });
 }
 
-function observeRequest(details, contentType = "") {
+async function observeRequest(details, contentType = "") {
   if (details.tabId < 0 || !isHttpUrl(details.url)) return;
   if (details.statusCode && details.statusCode >= 400) return;
 
   const kind = detectMediaKind(details.url, contentType);
   if (!kind && details.type !== "media") return;
+  const pageScope = pageScopeForRequest(details);
+  const state = await pageStateForRequest(details.tabId, pageScope);
+  if (!state || !isCurrentPage(details.tabId, pageScope, state.generation)) return;
 
   void upsertCandidate(details.tabId, {
     url: details.url,
     kind: kind || "other",
     contentType,
-    source: "network"
+    source: "network",
+    pageScope,
+    generation: state.generation
   });
 }
 
@@ -478,26 +611,45 @@ async function clearActiveDownload() {
   return { ok: true };
 }
 
-async function savePageMetadata(tabId, metadata) {
+async function savePageMetadata(tabId, metadata, senderPageUrl = "") {
+  const pageScope = pageScopeFromUrl(metadata.pageUrl);
+  const senderScope = pageScopeFromUrl(senderPageUrl);
+  const knownState = await initializeTabPageState(tabId);
+  if (knownState.scope && knownState.scope !== pageScope && senderScope !== pageScope) return;
+  const state = await activatePageScope(tabId, pageScope);
+  if (!state || !isCurrentPage(tabId, pageScope, state.generation)) return;
   const current = await getPageInfo(tabId);
-  await setPageInfo(tabId, {
-    url: redactedUrl(metadata.pageUrl),
-    title: metadata.pageTitle || current.title || "",
-    updatedAt: new Date().toISOString()
+  if (!isCurrentPage(tabId, pageScope, state.generation)) return;
+  await queueTabWrite(tabId, async () => {
+    if (!isCurrentPage(tabId, pageScope, state.generation)) return;
+    await setPageInfo(tabId, {
+      url: redactedUrl(metadata.pageUrl),
+      title: metadata.pageTitle || current.title || "",
+      scope: pageScope,
+      generation: state.generation,
+      updatedAt: new Date().toISOString()
+    });
   });
+  if (!isCurrentPage(tabId, pageScope, state.generation)) return;
 
   for (const url of metadata.videoUrls || []) {
     if (!isHttpUrl(url)) continue;
     const kind = detectMediaKind(url);
     if (kind) {
-      await upsertCandidate(tabId, { url, kind, source: "video element" });
+      await upsertCandidate(tabId, {
+        url,
+        kind,
+        source: "video element",
+        pageScope,
+        generation: state.generation
+      });
     }
   }
 }
 
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   if (message?.type === "pageMetadata" && sender.tab?.id >= 0) {
-    savePageMetadata(sender.tab.id, message).catch(() => undefined);
+    savePageMetadata(sender.tab.id, message, sender.tab.url).catch(() => undefined);
     return;
   }
 
@@ -547,12 +699,13 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   }
 });
 
-chrome.tabs.onUpdated.addListener((tabId, changeInfo) => {
-  if (changeInfo.status === "loading") {
-    void chrome.storage.session.remove([candidatesKey(tabId), pageKey(tabId)]);
-  }
+chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
+  const updatedUrl = changeInfo.url || tab?.url;
+  if (updatedUrl) void activatePageScope(tabId, pageScopeFromUrl(updatedUrl));
 });
 
 chrome.tabs.onRemoved.addListener((tabId) => {
+  tabPageStates.delete(tabId);
+  clearTabMemory(tabId);
   void chrome.storage.session.remove([candidatesKey(tabId), pageKey(tabId)]);
 });
