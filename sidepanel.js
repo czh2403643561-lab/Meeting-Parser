@@ -25,6 +25,13 @@ const batchSize = document.querySelector("#batch-size");
 const startBatchButton = document.querySelector("#start-batch");
 const pauseBatchButton = document.querySelector("#pause-batch");
 const resumeBatchButton = document.querySelector("#resume-batch");
+const batchTotalProgress = document.querySelector("#batch-total-progress");
+const batchTotalLabel = document.querySelector("#batch-total-label");
+const batchTotalBar = document.querySelector("#batch-total-bar");
+const toggleBatchLogsButton = document.querySelector("#toggle-batch-logs");
+const exportBatchLogsButton = document.querySelector("#export-batch-logs");
+const clearBatchLogsButton = document.querySelector("#clear-batch-logs");
+const batchLogOutput = document.querySelector("#batch-log-output");
 
 const labels = {
   mp4: "MP4",
@@ -43,6 +50,7 @@ let monitorTimer = null;
 let monitorToken = 0;
 let pendingFilename = "";
 let batchState = null;
+let batchDraft = { items: [], duplicateCount: 0, invalidCount: 0 };
 let batchMonitorTimer = null;
 
 function activeTab() {
@@ -116,6 +124,8 @@ function parseBatchLinks(text) {
 }
 
 const batchStatusLabels = {
+  starting: "正在启动批量任务",
+  idle: "等待开始",
   pending: "待处理",
   navigating: "正在打开页面",
   detecting: "正在发现 MP4",
@@ -124,6 +134,15 @@ const batchStatusLabels = {
   complete: "已完成",
   failed: "失败"
 };
+
+function renderBatchDraft(draft) {
+  batchDraft = draft || batchDraft;
+  const count = batchDraft.items?.length || 0;
+  batchSummary.textContent = count
+    ? `已解析 ${count} 条，等待开始 · 重复 ${batchDraft.duplicateCount || 0} 条 · 无效 ${batchDraft.invalidCount || 0} 条`
+    : "尚未解析";
+  if (!batchState?.tasks?.length) renderBatchItems(batchDraft.items || []);
+}
 
 function renderBatchItems(items) {
   batchList.replaceChildren();
@@ -170,16 +189,30 @@ function batchCounts(state) {
 function renderBatchState(state) {
   batchState = state;
   const tasks = state?.tasks || [];
+  if (!tasks.length && batchDraft.items?.length) {
+    batchTotalProgress.hidden = true;
+    batchProgress.hidden = true;
+    renderBatchDraft(batchDraft);
+    return;
+  }
   const counts = batchCounts({ tasks });
   const waiting = (counts.pending || 0) + (counts.navigating || 0) + (counts.detecting || 0) + (counts.preparing || 0) + (counts.downloading || 0);
   const current = tasks[state?.currentIndex] || null;
   batchSummary.textContent = `总数 ${counts.total} · 完成 ${counts.complete || 0} · 失败 ${counts.failed || 0} · 待处理 ${waiting}`;
   renderBatchItems(tasks);
 
+  batchTotalProgress.hidden = counts.total === 0;
+  if (counts.total) {
+    const processed = (counts.complete || 0) + (counts.failed || 0);
+    const percent = (processed / counts.total) * 100;
+    batchTotalBar.value = percent;
+    batchTotalLabel.textContent = `批量进度：${processed} / ${counts.total} · ${percent.toFixed(0)}%`;
+  }
+
   batchProgress.hidden = !current;
   if (current) {
     batchCurrent.textContent = `当前第 ${current.index + 1} / ${counts.total}`;
-    batchStatus.textContent = `${batchStatusLabels[current.status] || current.status}${current.filename ? `：${current.filename}` : current.pageTitle ? `：${current.pageTitle}` : ""}`;
+    batchStatus.textContent = state.statusMessage || `${batchStatusLabels[current.status] || current.status}${current.filename ? `：${current.filename}` : current.pageTitle ? `：${current.pageTitle}` : ""}`;
     const totalBytes = Number.isFinite(current.totalBytes) ? current.totalBytes : null;
     if (totalBytes !== null && current.status === "downloading") {
       const progress = Number.isFinite(current.progress) ? current.progress : 0;
@@ -193,13 +226,25 @@ function renderBatchState(state) {
   }
 
   mediaPreference.value = ["auto", "screen", "speaker"].includes(state?.mediaPreference) ? state.mediaPreference : "auto";
-  startBatchButton.hidden = state?.status === "running";
+  startBatchButton.hidden = ["starting", "running"].includes(state?.status);
   pauseBatchButton.hidden = state?.status !== "running";
   resumeBatchButton.hidden = state?.status !== "paused";
   startBatchButton.textContent = state?.status === "completed" ? "重新开始批量下载" : "开始批量下载";
   if (state?.status === "paused" && !current?.taskId) {
     batchStatus.textContent = "批量已暂停。";
   }
+}
+
+function formatBatchLog(entry) {
+  const time = entry.timestamp ? new Date(entry.timestamp).toLocaleTimeString("zh-CN", { hour12: false }) : "--:--:--";
+  const count = Number.isInteger(entry.totalTasks) ? ` tasks=${entry.totalTasks}` : "";
+  const tab = Number.isInteger(entry.workerTabId) ? ` tab=${entry.workerTabId}` : "";
+  return `${time}  ${entry.event || "event"}${count}${tab}${entry.message ? `  ${entry.message}` : ""}`;
+}
+
+async function refreshBatchLogs() {
+  const result = await chrome.runtime.sendMessage({ type: "getBatchLogs" });
+  if (!result?.error) batchLogOutput.textContent = (result.entries || []).slice(-30).map(formatBatchLog).join("\n") || "暂无日志";
 }
 
 function stopBatchMonitoring() {
@@ -213,7 +258,7 @@ function monitorBatchState() {
     try {
       const state = await chrome.runtime.sendMessage({ type: "getBatchState" });
       if (!state?.error) renderBatchState(state);
-      if (state?.status === "running" || state?.tasks?.[state.currentIndex]?.status === "downloading") {
+      if (["starting", "running"].includes(state?.status) || state?.tasks?.[state.currentIndex]?.status === "downloading") {
         batchMonitorTimer = setTimeout(poll, 800);
       }
     } catch {
@@ -500,19 +545,39 @@ batchFile.addEventListener("change", async () => {
 
 parseBatchButton.addEventListener("click", async () => {
   const result = parseBatchLinks(batchLinks.value);
-  const state = await chrome.runtime.sendMessage({ type: "setBatchTasks", items: result.items });
-  if (state?.error) {
-    batchSummary.textContent = state.error;
+  const draft = await chrome.runtime.sendMessage({
+    type: "saveBatchDraft",
+    items: result.items,
+    duplicateCount: result.duplicateCount,
+    invalidCount: result.invalidCount
+  });
+  if (draft?.error) {
+    batchSummary.textContent = draft.error;
     return;
   }
-  renderBatchState(state);
-  batchSummary.textContent = `已识别 ${result.items.length} 条 · 重复 ${result.duplicateCount} 条 · 无效 ${result.invalidCount} 条`;
+  batchDraft = draft;
+  if (draft.acceptedCount !== result.items.length) {
+    batchSummary.textContent = `解析状态异常：前端 ${result.items.length} 条，后台接受 ${draft.acceptedCount || 0} 条`;
+    return;
+  }
+  batchState = null;
+  renderBatchDraft(draft);
+  await refreshBatchLogs();
 });
 
 startBatchButton.addEventListener("click", async () => {
-  const state = await chrome.runtime.sendMessage({ type: "startBatch", mediaPreference: mediaPreference.value });
+  startBatchButton.disabled = true;
+  batchProgress.hidden = false;
+  batchStatus.textContent = "正在启动批量任务…";
+  const state = await chrome.runtime.sendMessage({
+    type: "startBatch",
+    mediaPreference: mediaPreference.value,
+    items: batchDraft.items
+  });
+  startBatchButton.disabled = false;
   if (state?.error) {
     batchSummary.textContent = state.error;
+    await refreshBatchLogs();
     return;
   }
   renderBatchState(state);
@@ -525,13 +590,37 @@ pauseBatchButton.addEventListener("click", async () => {
 });
 
 resumeBatchButton.addEventListener("click", async () => {
-  const state = await chrome.runtime.sendMessage({ type: "startBatch", mediaPreference: mediaPreference.value });
+  const state = await chrome.runtime.sendMessage({ type: "resumeBatch", mediaPreference: mediaPreference.value });
   if (state?.error) {
     batchSummary.textContent = state.error;
     return;
   }
   renderBatchState(state);
   monitorBatchState();
+});
+
+toggleBatchLogsButton.addEventListener("click", async () => {
+  batchLogOutput.hidden = !batchLogOutput.hidden;
+  toggleBatchLogsButton.textContent = batchLogOutput.hidden ? "查看运行日志" : "收起运行日志";
+  if (!batchLogOutput.hidden) await refreshBatchLogs();
+});
+
+exportBatchLogsButton.addEventListener("click", async () => {
+  const result = await chrome.runtime.sendMessage({ type: "getBatchLogs" });
+  const content = (result.entries || []).map(formatBatchLog).join("\n");
+  const blob = new Blob([content], { type: "text/plain;charset=utf-8" });
+  const url = URL.createObjectURL(blob);
+  const stamp = new Date().toISOString().replace(/[T:-]/g, "").replace(/\.\d{3}Z$/, "");
+  const link = document.createElement("a");
+  link.href = url;
+  link.download = `meeting-parser-batch-log-${stamp}.txt`;
+  link.click();
+  URL.revokeObjectURL(url);
+});
+
+clearBatchLogsButton.addEventListener("click", async () => {
+  await chrome.runtime.sendMessage({ type: "clearBatchLogs" });
+  await refreshBatchLogs();
 });
 
 chrome.runtime.onMessage.addListener((message) => {
@@ -552,13 +641,18 @@ chrome.runtime.onMessage.addListener((message) => {
       if (!state?.error) renderBatchState(state);
     });
   }
+  if (message?.type === "batchLogChanged" && !batchLogOutput.hidden) void refreshBatchLogs();
 });
 
 refreshButton.addEventListener("click", refresh);
-void chrome.runtime.sendMessage({ type: "getBatchState" }).then((state) => {
+void Promise.all([
+  chrome.runtime.sendMessage({ type: "getBatchDraft" }),
+  chrome.runtime.sendMessage({ type: "getBatchState" })
+]).then(([draft, state]) => {
+  if (!draft?.error) renderBatchDraft(draft);
   if (!state?.error) {
     renderBatchState(state);
-    if (state.status === "running" || state.tasks?.[state.currentIndex]?.status === "downloading") monitorBatchState();
+    if (["starting", "running"].includes(state.status) || state.tasks?.[state.currentIndex]?.status === "downloading") monitorBatchState();
   }
 });
 void refresh();

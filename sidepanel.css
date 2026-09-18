@@ -165,9 +165,34 @@ select {
   accent-color: #276ef1;
 }
 
+#batch-total-bar {
+  display: block;
+  width: 100%;
+  height: 10px;
+  margin-top: 8px;
+  accent-color: #276ef1;
+}
+
 .batch-actions {
   display: flex;
   gap: 8px;
+}
+
+.batch-logs {
+  margin-top: 14px;
+}
+
+#batch-log-output {
+  max-height: 230px;
+  margin: 8px 0 0;
+  padding: 8px;
+  overflow: auto;
+  white-space: pre-wrap;
+  border: 1px solid #d0d5dd;
+  border-radius: 6px;
+  color: #344054;
+  background: #fff;
+  font: 11px/1.45 ui-monospace, SFMono-Regular, Consolas, monospace;
 }
 
 .batch-list {

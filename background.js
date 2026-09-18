@@ -15,7 +15,10 @@ const LOCAL_FORWARD_HEADERS = new Set([
   "user-agent"
 ]);
 const ACTIVE_DOWNLOAD_KEY = "activeDownload";
+const BATCH_DRAFT_KEY = "batchDraft";
 const BATCH_STATE_KEY = "batchState";
+const BATCH_LOG_KEY = "batchEventLog";
+const MAX_BATCH_LOGS = 300;
 const BATCH_ALARM_NAME = "batchDownloadTick";
 const PAGE_LOAD_TIMEOUT_MS = 30 * 1000;
 const MEDIA_DETECT_TIMEOUT_MS = 20 * 1000;
@@ -24,6 +27,7 @@ const candidateUrlsById = new Map();
 const tabPageStates = new Map();
 const pageRequestInfoByTab = new Map();
 let batchAdvancing = false;
+let batchLogQueue = Promise.resolve();
 
 if (chrome.sidePanel?.setPanelBehavior) {
   void chrome.sidePanel.setPanelBehavior({ openPanelOnActionClick: true });
@@ -739,8 +743,49 @@ function emptyBatchState() {
     currentIndex: 0,
     startedAt: "",
     mediaPreference: "auto",
+    statusMessage: "",
+    error: "",
     tasks: []
   };
+}
+
+function safeBatchLogText(value) {
+  return String(value || "")
+    .replace(/https?:\/\/[^\s?]+\?[^\s]+/gi, "[redacted URL]")
+    .replace(/(cookie|authorization)\s*[:=]\s*[^\s,;]+/gi, "$1=[redacted]")
+    .slice(0, 240);
+}
+
+async function appendBatchLog(event, state, message = "", details = {}) {
+  const write = batchLogQueue.catch(() => undefined).then(async () => {
+    const result = await chrome.storage.session.get(BATCH_LOG_KEY);
+    const previous = Array.isArray(result[BATCH_LOG_KEY]) ? result[BATCH_LOG_KEY] : [];
+    const entry = {
+      timestamp: new Date().toISOString(),
+      event,
+      batchStatus: state?.status || "idle",
+      currentIndex: Number.isInteger(state?.currentIndex) ? state.currentIndex : 0,
+      totalTasks: Array.isArray(state?.tasks) ? state.tasks.length : 0,
+      taskStatus: batchTask(state)?.status || "",
+      workerTabId: Number.isInteger(state?.workerTabId) ? state.workerTabId : null,
+      message: safeBatchLogText(message)
+    };
+    if (Number.isInteger(details.count)) entry.count = details.count;
+    if (typeof details.variant === "string") entry.variant = details.variant;
+    if (typeof details.mediaFilename === "string") entry.mediaFilename = safeBatchLogText(details.mediaFilename);
+    await chrome.storage.session.set({ [BATCH_LOG_KEY]: [...previous, entry].slice(-MAX_BATCH_LOGS) });
+    void chrome.runtime.sendMessage({ type: "batchLogChanged" }).catch(() => undefined);
+  });
+  batchLogQueue = write;
+  return write;
+}
+
+async function getBatchDraft() {
+  const result = await chrome.storage.session.get(BATCH_DRAFT_KEY);
+  const draft = result[BATCH_DRAFT_KEY];
+  return draft && Array.isArray(draft.items)
+    ? { items: draft.items, duplicateCount: Number(draft.duplicateCount) || 0, invalidCount: Number(draft.invalidCount) || 0, updatedAt: draft.updatedAt || "" }
+    : { items: [], duplicateCount: 0, invalidCount: 0, updatedAt: "" };
 }
 
 async function getBatchState() {
@@ -831,11 +876,15 @@ async function ensureBatchWorker(state, task) {
       state.workerTabId = null;
     }
   }
+  await appendBatchLog("worker_tab_creating", state, "正在创建工作标签页");
   const tab = await chrome.tabs.create({ url: task.pageUrl, active: false });
   state.workerTabId = tab.id;
   task.status = "navigating";
   task.phaseStartedAt = Date.now();
+  state.statusMessage = `正在打开第 ${task.index + 1} / ${state.tasks.length} 条…`;
   await saveBatchState(state);
+  await appendBatchLog("worker_tab_created", state, "工作标签页已创建");
+  await appendBatchLog("worker_navigating", state, `正在打开第 ${task.index + 1} 条`);
   return tab.id;
 }
 
@@ -852,6 +901,7 @@ async function failBatchTask(state, task, error) {
   task.error = error;
   task.phaseStartedAt = 0;
   await saveBatchState(state);
+  await appendBatchLog("task_failed", state, error);
   queueBatchAdvance();
 }
 
@@ -868,6 +918,8 @@ async function advanceBatchQueue() {
       const nextIndex = nextPendingBatchIndex(state);
       if (nextIndex < 0) {
         state.status = "completed";
+        state.statusMessage = "批量任务已完成。";
+        await appendBatchLog("queue_complete", state, "全部任务已处理");
         await closeBatchWorker(state);
         return;
       }
@@ -909,7 +961,18 @@ async function advanceBatchQueue() {
           task.status = "failed";
           task.error = download.error || "本地下载失败。";
         }
+        const terminal = ["complete", "failed"].includes(task.status);
+        const progressBucket = Number.isFinite(task.progress) ? Math.floor(task.progress / 5) : -1;
+        const shouldLogProgress = terminal || progressBucket !== task.lastLoggedProgressBucket;
+        if (shouldLogProgress) task.lastLoggedProgressBucket = progressBucket;
         await saveBatchState(state);
+        if (shouldLogProgress) {
+          await appendBatchLog(
+            terminal ? (task.status === "complete" ? "task_complete" : "task_failed") : "local_download_progress",
+            state,
+            task.error || "本地下载状态已更新"
+          );
+        }
         if (["complete", "failed"].includes(task.status)) queueBatchAdvance();
         else scheduleBatchTick();
       } catch {
@@ -938,9 +1001,20 @@ async function advanceBatchQueue() {
         return failBatchTask(state, task, task.status === "preparing" ? "媒体上下文准备失败。" : "未发现 MP4。");
     }
 
+    state.statusMessage = "正在检测 MP4…";
+    await saveBatchState(state);
+    if (!task.mediaScanLogged) {
+      task.mediaScanLogged = true;
+      await appendBatchLog("media_scan", state, "正在扫描媒体资源");
+    }
     await chrome.tabs.sendMessage(workerTabId, { type: "scanPageMedia" }).catch(() => undefined);
     const [candidates, page] = await Promise.all([getCandidates(workerTabId), getPageInfo(workerTabId)]);
     task.pageTitle = page.title || task.pageTitle || "";
+    const mp4Count = candidates.filter((candidate) => candidate.kind === "mp4").length;
+    if (task.lastCandidateLogCount !== mp4Count) {
+      task.lastCandidateLogCount = mp4Count;
+      await appendBatchLog("media_candidates_found", state, `发现 ${mp4Count} 个 MP4`, { count: candidates.length });
+    }
     const selected = selectBatchCandidate(candidates, state.mediaPreference);
     if (selected.error) return failBatchTask(state, task, selected.error);
     if (!selected.candidate) {
@@ -949,10 +1023,16 @@ async function advanceBatchQueue() {
       return;
     }
 
+    await appendBatchLog("media_candidate_selected", state, "已选择 MP4", {
+      variant: selected.candidate.variant || "other",
+      mediaFilename: selected.candidate.mediaFilename || ""
+    });
     task.status = "preparing";
     task.phaseStartedAt = Date.now();
     task.filename = batchFilename(task, selected.candidate);
+    state.statusMessage = "正在准备下载…";
     await saveBatchState(state);
+    await appendBatchLog("media_prepare_started", state, "正在准备下载上下文");
     if ((await getBatchState()).status !== "running") return;
     try {
       const started = await prepareCandidateAndStartDownload(
@@ -971,68 +1051,110 @@ async function advanceBatchQueue() {
       task.bytes = 0;
       task.totalBytes = null;
       task.progress = null;
+      state.statusMessage = "下载中…";
       await saveBatchState(state);
+      await appendBatchLog("local_download_submitted", state, "已提交本地下载器");
       queueBatchAdvance();
     } catch (error) {
       await failBatchTask(state, task, error.message === "自动准备失败，请播放视频后重试。" ? "媒体上下文准备失败。" : error.message);
     }
+  } catch (error) {
+    const state = await getBatchState();
+    state.status = "failed";
+    state.error = safeBatchLogText(error?.message || "批量调度发生未知错误。");
+    state.statusMessage = `启动失败：${state.error}`;
+    await saveBatchState(state);
+    await appendBatchLog("unexpected_error", state, state.error);
   } finally {
     batchAdvancing = false;
   }
 }
 
-async function setBatchTasks(message) {
+async function saveBatchDraft(message) {
   const items = Array.isArray(message.items) ? message.items : [];
-  const tasks = items
-    .filter((item) => typeof item?.url === "string" && /^https:\/\/meeting\.tencent\.com\/(?:crm|cw)\//i.test(item.url))
-    .map((item, index) => ({
-      index,
-      pageUrl: item.url,
-      status: "pending",
-      pageTitle: "",
-      filename: "",
-      taskId: "",
-      bytes: 0,
-      totalBytes: null,
-      progress: null,
-      error: ""
-    }));
+  const accepted = items
+    .filter((item) => typeof item?.url === "string" && /^https?:\/\/meeting\.tencent\.com\/(?:crm|cw)\//i.test(item.url))
+    .map((item) => ({ url: item.url }));
+  const draft = {
+    items: accepted,
+    duplicateCount: Number(message.duplicateCount) || 0,
+    invalidCount: Number(message.invalidCount) || 0,
+    updatedAt: new Date().toISOString()
+  };
   const existing = await getBatchState();
   if (existing.status === "running") throw new Error("批量下载正在运行，不能替换任务列表。");
-  const state = { ...emptyBatchState(), mediaPreference: existing.mediaPreference, tasks };
-  await saveBatchState(state);
-  return state;
+  await appendBatchLog("batch_parse_received", existing, `前端提交 ${items.length} 条`);
+  await chrome.storage.session.set({ [BATCH_DRAFT_KEY]: draft });
+  await appendBatchLog("batch_draft_saved", existing, `后台接受 ${accepted.length} 条`);
+  return { ...draft, acceptedCount: accepted.length };
 }
 
 async function startBatch(message) {
-  const state = await getBatchState();
-  if (!state.tasks.length) throw new Error("请先解析至少一条腾讯会议链接。");
-  if (state.status === "running") return state;
+  const requestedItems = Array.isArray(message.items) ? message.items : (await getBatchDraft()).items;
+  const accepted = requestedItems
+    .filter((item) => typeof item?.url === "string" && /^https?:\/\/meeting\.tencent\.com\/(?:crm|cw)\//i.test(item.url))
+    .map((item) => item.url);
+  const previous = await getBatchState();
+  await appendBatchLog("batch_start_requested", previous, `请求启动 ${accepted.length} 条`);
+  if (!accepted.length) throw new Error("请先解析至少一条腾讯会议链接。");
+  if (previous.status === "running") return previous;
+  if (previous.status === "paused" && previous.tasks.length) return resumeBatch(message.mediaPreference);
   const health = await checkLocalDownloader();
-  if (!health.ok) throw new Error(health.error || "本地下载器未启动，请先运行 local_downloader.py");
-  state.status = "running";
+  if (!health.ok) {
+    await appendBatchLog("batch_health_failed", previous, health.error || "本地下载器未启动");
+    throw new Error(health.error || "本地下载器未启动，请先运行 local_downloader.py");
+  }
+  await appendBatchLog("batch_health_ok", previous, "本地下载器可用");
+  const state = {
+    ...emptyBatchState(),
+    status: "starting",
+    startedAt: new Date().toISOString(),
+    tasks: accepted.map((pageUrl, index) => ({
+      index, pageUrl, status: "pending", pageTitle: "", filename: "", taskId: "", bytes: 0,
+      totalBytes: null, progress: null, error: ""
+    }))
+  };
   state.mediaPreference = ["auto", "screen", "speaker"].includes(message.mediaPreference)
     ? message.mediaPreference
-    : state.mediaPreference || "auto";
-  state.startedAt = state.startedAt || new Date().toISOString();
-  if (!batchTask(state) || ["complete", "failed"].includes(batchTask(state).status)) {
-    const nextIndex = nextPendingBatchIndex(state);
-    if (nextIndex < 0) throw new Error("没有待下载任务，请先重新解析链接或重试失败项。");
-    state.currentIndex = nextIndex;
-  }
+    : previous.mediaPreference || "auto";
   await saveBatchState(state);
+  await appendBatchLog("batch_state_created", state, `已创建 ${state.tasks.length} 条执行任务`);
+  const verified = await getBatchState();
+  if (verified.tasks.length !== accepted.length) {
+    await appendBatchLog("unexpected_error", verified, `输入 ${accepted.length} 条，实际保存 ${verified.tasks.length} 条`);
+    throw new Error(`批量队列创建失败：输入 ${accepted.length} 条，实际保存 ${verified.tasks.length} 条。`);
+  }
+  await appendBatchLog("batch_state_verified", verified, `已校验 ${verified.tasks.length} 条任务`);
+  verified.status = "running";
+  verified.statusMessage = "正在创建工作标签页…";
+  await saveBatchState(verified);
   await chrome.alarms.create(BATCH_ALARM_NAME, { periodInMinutes: 0.5 });
-  queueBatchAdvance();
-  return state;
+  await advanceBatchQueue();
+  return getBatchState();
 }
 
 async function pauseBatch() {
   const state = await getBatchState();
   if (state.status === "running") {
     state.status = "paused";
+    state.statusMessage = "批量已暂停。";
     await saveBatchState(state);
+    await appendBatchLog("queue_paused", state, "批量已暂停");
   }
   return state;
+}
+
+async function resumeBatch(preference) {
+  const state = await getBatchState();
+  if (state.status !== "paused") return state;
+  state.status = "running";
+  state.statusMessage = "正在继续批量任务…";
+  if (["auto", "screen", "speaker"].includes(preference)) state.mediaPreference = preference;
+  await saveBatchState(state);
+  await appendBatchLog("queue_resumed", state, "批量任务已继续");
+  await chrome.alarms.create(BATCH_ALARM_NAME, { periodInMinutes: 0.5 });
+  await advanceBatchQueue();
+  return getBatchState();
 }
 
 async function retryBatchTask(index) {
@@ -1054,7 +1176,9 @@ async function notifyBatchMetadata(tabId, pageTitle) {
     task.status = "detecting";
     task.phaseStartedAt = Date.now();
   }
+  state.statusMessage = "正在检测 MP4…";
   await saveBatchState(state);
+  await appendBatchLog("metadata_received", state, "已收到页面信息");
   queueBatchAdvance();
 }
 
@@ -1167,8 +1291,38 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   }
 
   if (message?.type === "setBatchTasks") {
-    setBatchTasks(message)
-      .then((state) => sendResponse(state))
+    saveBatchDraft(message)
+      .then((draft) => sendResponse(draft))
+      .catch((error) => sendResponse({ error: error.message }));
+    return true;
+  }
+
+  if (message?.type === "saveBatchDraft") {
+    saveBatchDraft(message)
+      .then((draft) => sendResponse(draft))
+      .catch((error) => sendResponse({ error: error.message }));
+    return true;
+  }
+
+  if (message?.type === "getBatchDraft") {
+    getBatchDraft()
+      .then((draft) => sendResponse(draft))
+      .catch((error) => sendResponse({ error: error.message }));
+    return true;
+  }
+
+  if (message?.type === "getBatchLogs") {
+    chrome.storage.session
+      .get(BATCH_LOG_KEY)
+      .then((result) => sendResponse({ entries: Array.isArray(result[BATCH_LOG_KEY]) ? result[BATCH_LOG_KEY] : [] }))
+      .catch((error) => sendResponse({ error: error.message }));
+    return true;
+  }
+
+  if (message?.type === "clearBatchLogs") {
+    chrome.storage.session
+      .remove(BATCH_LOG_KEY)
+      .then(() => sendResponse({ ok: true }))
       .catch((error) => sendResponse({ error: error.message }));
     return true;
   }
@@ -1199,6 +1353,13 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     return true;
   }
 
+  if (message?.type === "resumeBatch") {
+    resumeBatch(message.mediaPreference)
+      .then((state) => sendResponse(state))
+      .catch((error) => sendResponse({ error: error.message }));
+    return true;
+  }
+
   if (message?.type === "retryBatchTask") {
     retryBatchTask(message.index)
       .then((state) => sendResponse(state))
@@ -1217,7 +1378,9 @@ chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
       if (state.status !== "running" || state.workerTabId !== tabId || !task || task.status !== "navigating") return;
       task.status = "detecting";
       task.phaseStartedAt = Date.now();
+      state.statusMessage = "正在检测 MP4…";
       await saveBatchState(state);
+      await appendBatchLog("page_loaded", state, "页面加载完成");
       queueBatchAdvance();
     })();
   }

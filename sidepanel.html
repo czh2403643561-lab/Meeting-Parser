@@ -53,6 +53,10 @@
           </select>
         </label>
         <p id="batch-summary" class="batch-summary">尚未解析</p>
+        <section id="batch-total-progress" class="batch-progress" hidden>
+          <strong id="batch-total-label"></strong>
+          <progress id="batch-total-bar" max="100" value="0"></progress>
+        </section>
         <section id="batch-progress" class="batch-progress" hidden>
           <strong id="batch-current"></strong>
           <p id="batch-status" role="status"></p>
@@ -65,6 +69,17 @@
           <button id="pause-batch" class="secondary-button" type="button" hidden>暂停</button>
           <button id="resume-batch" type="button" hidden>继续</button>
         </div>
+        <section class="batch-logs">
+          <div class="download-heading">
+            <strong>运行日志</strong>
+            <span>
+              <button id="toggle-batch-logs" class="secondary-button" type="button">查看运行日志</button>
+              <button id="export-batch-logs" class="secondary-button" type="button">导出日志</button>
+              <button id="clear-batch-logs" class="secondary-button" type="button">清空日志</button>
+            </span>
+          </div>
+          <pre id="batch-log-output" hidden></pre>
+        </section>
       </section>
     </main>
     <script src="sidepanel.js"></script>
