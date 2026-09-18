@@ -1,0 +1,22 @@
+{
+  "manifest_version": 3,
+  "name": "Media Resource Finder",
+  "version": "0.1.0",
+  "description": "Detect media requests from the current page and download direct MP4 files.",
+  "permissions": ["activeTab", "downloads", "storage", "webRequest"],
+  "host_permissions": ["<all_urls>"],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "action": {
+    "default_title": "媒体资源嗅探器",
+    "default_popup": "popup.html"
+  },
+  "content_scripts": [
+    {
+      "matches": ["<all_urls>"],
+      "js": ["content.js"],
+      "run_at": "document_idle"
+    }
+  ]
+}

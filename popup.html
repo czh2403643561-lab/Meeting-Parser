@@ -1,0 +1,23 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>媒体资源嗅探器</title>
+    <link rel="stylesheet" href="popup.css" />
+  </head>
+  <body>
+    <main>
+      <header>
+        <div>
+          <h1>媒体资源</h1>
+          <p id="page-title">正在读取当前页面…</p>
+        </div>
+        <button id="refresh" type="button">刷新</button>
+      </header>
+      <p id="status" role="status"></p>
+      <section id="candidates" aria-live="polite"></section>
+    </main>
+    <script src="popup.js"></script>
+  </body>
+</html>
