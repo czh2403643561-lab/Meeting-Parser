@@ -100,13 +100,29 @@ function isScrollableTranscriptElement(element) {
   if (!visibleTranscriptElement(element)) return false;
   const style = typeof getComputedStyle === "function" ? getComputedStyle(element) : null;
   const overflowY = style?.overflowY || "";
-  return element.scrollHeight > element.clientHeight + 40
+  return element.clientHeight > 0
+    && element.scrollHeight > element.clientHeight + 40
     && (overflowY === "auto" || overflowY === "scroll" || element.scrollHeight > element.clientHeight * 1.5);
 }
 
 function findTranscriptContainer() {
   const explicitRoot = document.querySelector("#minutes-scroll-container");
-  const scopedElements = explicitRoot ? [explicitRoot, ...explicitRoot.querySelectorAll("*")] : [];
+  if (explicitRoot) {
+    const scopedCandidates = [explicitRoot, ...explicitRoot.querySelectorAll("*")]
+      .filter((element) => isScrollableTranscriptElement(element))
+      .map((element) => ({
+        element,
+        pidCount: element.querySelectorAll('[id^="pid-"][id$="-content"]').length,
+        textLength: transcriptElementText(element).length
+      }))
+      .filter((candidate) => candidate.pidCount > 0 || candidate.textLength >= 40)
+      .sort((left, right) => {
+        if (right.pidCount !== left.pidCount) return right.pidCount - left.pidCount;
+        return right.textLength - left.textLength;
+      });
+    return scopedCandidates[0]?.element || explicitRoot;
+  }
+
   const labelElements = [...document.querySelectorAll("body *")]
     .filter((element) => /逐字稿/iu.test(element.textContent || "") && (element.textContent || "").length < 120);
   const roots = new Set();
@@ -115,7 +131,7 @@ function findTranscriptContainer() {
     for (let depth = 0; current && depth < 8; depth += 1, current = current.parentElement) roots.add(current);
   }
 
-  const candidates = new Set(scopedElements);
+  const candidates = new Set();
   for (const root of roots) {
     if (isScrollableTranscriptElement(root)) candidates.add(root);
     for (const element of root.querySelectorAll("*")) {
@@ -210,6 +226,23 @@ function waitForTranscriptRender(delayMs = 280) {
   return new Promise((resolve) => setTimeout(resolve, delayMs));
 }
 
+function reportTranscriptProgress(stage, records) {
+  const textLength = records.reduce((total, record) => total + record.text.length, 0);
+  try {
+    const response = chrome.runtime.sendMessage({
+      type: "transcriptProgress",
+      progress: {
+        stage,
+        paragraphCount: records.length,
+        textLength
+      }
+    });
+    if (response && typeof response.catch === "function") response.catch(() => undefined);
+  } catch {
+    // The page can outlive an extension reload while extraction is running.
+  }
+}
+
 async function extractFullTranscript() {
   const container = findTranscriptContainer();
   if (!container) return { transcriptFound: false };
@@ -222,6 +255,7 @@ async function extractFullTranscript() {
   let stableBottomPasses = 0;
 
   try {
+    reportTranscriptProgress("初始化", records);
     container.scrollTop = 0;
     container.dispatchEvent(new Event("scroll", { bubbles: true }));
     await waitForTranscriptRender();
@@ -243,6 +277,7 @@ async function extractFullTranscript() {
         fallbackOrder += 1;
         added += 1;
       }
+      reportTranscriptProgress("滚动采集中", records);
 
       const maxScrollTop = Math.max(0, container.scrollHeight - container.clientHeight);
       const atBottom = container.scrollTop >= maxScrollTop - 4;
@@ -270,6 +305,7 @@ async function extractFullTranscript() {
   records.sort((left, right) => left.order - right.order);
   const fullText = records.map((record) => record.text).join("\n\n").trim();
   if (!fullText) return { transcriptFound: false };
+  reportTranscriptProgress("完成", records);
   return {
     transcriptFound: true,
     paragraphCount: records.length,

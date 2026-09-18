@@ -1573,6 +1573,15 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     return;
   }
 
+  if (message?.type === "transcriptProgress" && sender.tab?.id >= 0) {
+    void chrome.runtime.sendMessage({
+      type: "transcriptProgress",
+      tabId: sender.tab.id,
+      progress: message.progress
+    }).catch(() => undefined);
+    return;
+  }
+
   if (message?.type === "getCandidates" && Number.isInteger(message.tabId)) {
     Promise.all([getCandidates(message.tabId), getPageInfo(message.tabId)])
       .then(([candidates, page]) => sendResponse({ candidates, page }))

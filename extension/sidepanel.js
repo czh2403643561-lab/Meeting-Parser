@@ -88,6 +88,7 @@ let onboardingNeedsUpdate = false;
 const COLLAPSE_STATE_KEY = "sidePanelCollapseState";
 let collapseState = {};
 let latestTranscript = null;
+let diagnosticTabId = null;
 
 if (chrome.downloads?.onChanged) {
   chrome.downloads.onChanged.addListener((delta) => {
@@ -817,6 +818,17 @@ function renderPageDiagnostic(result, tab) {
   diagnosticResults.hidden = false;
 }
 
+function renderTranscriptProgress(progress) {
+  if (!progress) return;
+  diagnosticResults.hidden = false;
+  diagnosticStatus.textContent = progress.stage || "滚动采集中";
+  diagnosticTranscript.textContent = progress.stage === "完成" ? "已发现疑似正文" : "正在采集正文";
+  diagnosticParagraphCount.textContent = String(progress.paragraphCount ?? 0);
+  diagnosticTextLength.textContent = String(progress.textLength ?? 0);
+  diagnosticPreview.textContent = progress.stage === "完成" ? diagnosticPreview.textContent : "正在收集逐字稿…";
+  diagnosticFeedback.textContent = `${progress.stage || "滚动采集中"}：已采集 ${progress.paragraphCount ?? 0} 段，${progress.textLength ?? 0} 字。`;
+}
+
 async function runPageDiagnostic() {
   runPageDiagnosticButton.disabled = true;
   diagnosticResults.hidden = true;
@@ -825,6 +837,10 @@ async function runPageDiagnostic() {
   try {
     const tab = await activeTab();
     if (!tab?.id) throw new Error("无法读取当前页面。");
+    diagnosticTabId = tab.id;
+    diagnosticPage.textContent = `${tab.title || "录制文件"}\n${tab.url || ""}\n腾讯会议录制页面：检测中`;
+    diagnosticVideo.textContent = "检测中";
+    diagnosticResults.hidden = false;
     const result = await chrome.tabs.sendMessage(tab.id, { type: "runPageDiagnostic" });
     if (!result) throw new Error("当前页面暂不支持诊断。");
     renderPageDiagnostic(result, tab);
@@ -1057,6 +1073,9 @@ clearBatchLogsButton.addEventListener("click", async () => {
 });
 
 chrome.runtime.onMessage.addListener((message) => {
+  if (message?.type === "transcriptProgress" && message.tabId === diagnosticTabId) {
+    renderTranscriptProgress(message.progress);
+  }
   if (message?.type === "downloadPreparation") {
     void activeTab().then((tab) => {
       if (tab?.id === message.tabId) {
