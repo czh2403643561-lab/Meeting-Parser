@@ -5,7 +5,9 @@ from __future__ import annotations
 import json
 import os
 import re
+import socket
 import threading
+import time
 import uuid
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -15,12 +17,13 @@ from urllib.parse import urlsplit, parse_qs
 from urllib.request import HTTPRedirectHandler, Request, build_opener
 
 HOST = "127.0.0.1"
-PORT = 8765
+PORT = int(os.environ.get("MEETING_PARSER_PORT", "8765"))
 CHUNK_SIZE = 1024 * 1024
 MAX_JSON_BYTES = 256 * 1024
 MAX_HEADER_VALUE_LENGTH = 8192
 LOG_BYTES_STEP = 50 * 1024 * 1024
 LOG_PERCENT_STEP = 5
+IDLE_EXIT_SECONDS = int(os.environ.get("MEETING_PARSER_IDLE_SECONDS", str(15 * 60)))
 
 ALLOWED_HEADERS = {
     "accept",
@@ -63,10 +66,39 @@ BAD_CONTENT_TYPES = (
 
 TASKS: dict[str, dict] = {}
 TASKS_LOCK = threading.RLock()
+ACTIVITY_LOCK = threading.Lock()
+LAST_ACTIVITY = time.monotonic()
+CLIENT_DISCONNECT_ERRNOS = {
+    getattr(socket, "EPIPE", 32),
+    getattr(socket, "ECONNRESET", 10054),
+    getattr(socket, "ECONNABORTED", 10053),
+    10053,  # Windows: software caused connection abort.
+    10054,  # Windows: connection reset by peer.
+}
 
 
 class DownloadError(Exception):
     """An expected download failure that is safe to return to the extension."""
+
+
+def note_activity() -> None:
+    global LAST_ACTIVITY
+    with ACTIVITY_LOCK:
+        LAST_ACTIVITY = time.monotonic()
+
+
+def seconds_since_activity() -> float:
+    with ACTIVITY_LOCK:
+        return time.monotonic() - LAST_ACTIVITY
+
+
+def has_active_tasks() -> bool:
+    with TASKS_LOCK:
+        return any(task["status"] in {"queued", "connecting", "downloading"} for task in TASKS.values())
+
+
+def is_client_disconnect(error: OSError) -> bool:
+    return error.errno in CLIENT_DISCONNECT_ERRNOS
 
 
 def downloads_directory() -> Path:
@@ -203,6 +235,7 @@ def run_download(task_id: str, url: str, headers: dict[str, str], filename: str)
     last_log_bytes = 0
     last_log_progress = 0
     try:
+        note_activity()
         print(f"[task] started: {filename}", flush=True)
         target = unique_target(filename)
         part = target.with_name(target.name + ".part")
@@ -252,6 +285,7 @@ def run_download(task_id: str, url: str, headers: dict[str, str], filename: str)
                         break
                     output.write(chunk)
                     total += len(chunk)
+                    note_activity()
                     progress = progress_for(total, total_bytes)
                     update_task(task_id, bytes=total, totalBytes=total_bytes, progress=progress)
             last_log_bytes, last_log_progress = log_progress(
@@ -291,9 +325,12 @@ def run_download(task_id: str, url: str, headers: dict[str, str], filename: str)
             progress=progress_for(total, total_bytes),
         )
         print(f"[task] failed: {message}", flush=True)
+    finally:
+        note_activity()
 
 
 def create_download(payload: dict) -> tuple[str, str]:
+    note_activity()
     url = validate_url(payload.get("url"))
     filename = safe_filename(payload.get("filename", "video.mp4"))
     headers = filter_request_headers(payload.get("headers", {}))
@@ -322,15 +359,37 @@ class DownloaderHandler(BaseHTTPRequestHandler):
         # Request bodies can contain signed URLs or authentication headers.
         return
 
+    def handle_one_request(self) -> None:
+        try:
+            super().handle_one_request()
+        except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
+            self.close_connection = True
+        except OSError as error:
+            if is_client_disconnect(error):
+                self.close_connection = True
+                return
+            raise
+
     def send_json(self, status: int, payload: dict) -> None:
         data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
-        self.send_response(status)
-        self.send_header("Content-Type", "application/json; charset=utf-8")
-        self.send_header("Content-Length", str(len(data)))
-        self.end_headers()
-        self.wfile.write(data)
+        try:
+            self.send_response(status)
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.send_header("Content-Length", str(len(data)))
+            self.send_header("Connection", "close")
+            self.end_headers()
+            self.wfile.write(data)
+            self.wfile.flush()
+        except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
+            self.close_connection = True
+        except OSError as error:
+            if is_client_disconnect(error):
+                self.close_connection = True
+                return
+            raise
 
     def do_GET(self):  # noqa: N802
+        note_activity()
         parsed = urlsplit(self.path)
         if parsed.path == "/health":
             self.send_json(HTTPStatus.OK, {"ok": True, "service": "local-downloader"})
@@ -346,6 +405,7 @@ class DownloaderHandler(BaseHTTPRequestHandler):
         self.send_json(HTTPStatus.NOT_FOUND, {"error": "接口不存在。"})
 
     def do_POST(self):  # noqa: N802
+        note_activity()
         if urlsplit(self.path).path != "/download":
             self.send_json(HTTPStatus.NOT_FOUND, {"error": "接口不存在。"})
             return
@@ -368,9 +428,14 @@ class DownloaderHandler(BaseHTTPRequestHandler):
 
 def run_server() -> None:
     server = ThreadingHTTPServer((HOST, PORT), DownloaderHandler)
+    server.timeout = 1
     print(f"Local downloader listening on http://{HOST}:{PORT}")
     try:
-        server.serve_forever()
+        while True:
+            server.handle_request()
+            if not has_active_tasks() and seconds_since_activity() >= IDLE_EXIT_SECONDS:
+                print("Local downloader stopped after idle timeout.")
+                break
     except KeyboardInterrupt:
         pass
     finally:

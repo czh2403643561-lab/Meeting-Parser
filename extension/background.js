@@ -18,6 +18,9 @@ const ACTIVE_DOWNLOAD_KEY = "activeDownload";
 const BATCH_DRAFT_KEY = "batchDraft";
 const BATCH_STATE_KEY = "batchState";
 const BATCH_LOG_KEY = "batchEventLog";
+const BATCH_SESSION_KEY = "batchBrowserSessionActive";
+const NATIVE_HOST_NAME = "com.meetingparser.helper";
+const LOCAL_DOWNLOADER_BASE = "http://127.0.0.1:8765";
 const MAX_BATCH_LOGS = 300;
 const BATCH_ALARM_NAME = "batchDownloadTick";
 const PAGE_LOAD_TIMEOUT_MS = 30 * 1000;
@@ -28,6 +31,9 @@ const tabPageStates = new Map();
 const pageRequestInfoByTab = new Map();
 let batchAdvancing = false;
 let batchLogQueue = Promise.resolve();
+let localDownloaderStarting = null;
+let localDownloaderState = "checking";
+let keepAwakeRequested = false;
 
 if (chrome.sidePanel?.setPanelBehavior) {
   void chrome.sidePanel.setPanelBehavior({ openPanelOnActionClick: true });
@@ -544,8 +550,6 @@ function filenameForDownload(url, pageTitle) {
   return `${title || filePart || fallback}.mp4`;
 }
 
-const LOCAL_DOWNLOADER_BASE = "http://127.0.0.1:8765";
-
 async function localDownloaderRequest(path, options = {}) {
   let response;
   try {
@@ -554,7 +558,7 @@ async function localDownloaderRequest(path, options = {}) {
       ...options
     });
   } catch {
-    throw new Error("本地下载器未启动，请先运行 local_downloader.py");
+    throw new Error("本地下载服务暂时不可用。");
   }
 
   let body = {};
@@ -569,12 +573,87 @@ async function localDownloaderRequest(path, options = {}) {
   return body;
 }
 
-async function checkLocalDownloader() {
+function setLocalDownloaderState(state) {
+  if (localDownloaderState === state) return;
+  localDownloaderState = state;
+  void chrome.runtime.sendMessage({ type: "localDownloaderStateChanged", state }).catch(() => undefined);
+}
+
+async function checkLocalDownloaderHealth() {
   try {
     const result = await localDownloaderRequest("/health");
     return { ok: result.ok === true };
   } catch (error) {
     return { ok: false, error: error.message };
+  }
+}
+
+function sendNativeMessage(message) {
+  return new Promise((resolve, reject) => {
+    chrome.runtime.sendNativeMessage(NATIVE_HOST_NAME, message, (response) => {
+      const error = chrome.runtime.lastError;
+      if (error) reject(new Error(error.message));
+      else resolve(response || {});
+    });
+  });
+}
+
+function nativeHostMissing(error) {
+  return /native messaging host|host.*not found|未找到|找不到/i.test(error?.message || "");
+}
+
+async function ensureLocalDownloader() {
+  const health = await checkLocalDownloaderHealth();
+  if (health.ok) {
+    setLocalDownloaderState("ready");
+    return { ok: true, state: "ready" };
+  }
+  if (localDownloaderStarting) return localDownloaderStarting;
+
+  localDownloaderStarting = (async () => {
+    setLocalDownloaderState("starting");
+    let helper;
+    try {
+      helper = await sendNativeMessage({ action: "ensureDownloader" });
+    } catch (error) {
+      setLocalDownloaderState(nativeHostMissing(error) ? "not-installed" : "unavailable");
+      throw new Error(
+        nativeHostMissing(error)
+          ? "本地组件尚未安装，请先完成一次安装。"
+          : "本地组件暂时不可用，请稍后重试。"
+      );
+    }
+
+    if (!helper?.ok) {
+      const missing = ["downloader_missing", "unsupported_action"].includes(helper?.code);
+      setLocalDownloaderState(missing ? "not-installed" : "unavailable");
+      throw new Error(missing ? "本地组件尚未安装，请先完成一次安装。" : "本地组件启动失败，请稍后重试。");
+    }
+
+    for (let attempt = 0; attempt < 12; attempt += 1) {
+      const retry = await checkLocalDownloaderHealth();
+      if (retry.ok) {
+        setLocalDownloaderState("ready");
+        return { ok: true, state: "ready" };
+      }
+      await waitFor(250);
+    }
+    setLocalDownloaderState("unavailable");
+    throw new Error("本地组件启动失败，请稍后重试。");
+  })();
+
+  try {
+    return await localDownloaderStarting;
+  } finally {
+    localDownloaderStarting = null;
+  }
+}
+
+async function checkLocalDownloader() {
+  try {
+    return await ensureLocalDownloader();
+  } catch (error) {
+    return { ok: false, error: error.message, state: localDownloaderState };
   }
 }
 
@@ -673,7 +752,7 @@ async function prepareCandidateAndStartDownload(message, options = {}) {
   }
 
   notifyDownloadStage(message.tabId, message.candidateId, "connecting");
-  await localDownloaderRequest("/health");
+  await ensureLocalDownloader();
   notifyDownloadStage(message.tabId, message.candidateId, "submitting");
   const result = await localDownloaderRequest("/download", {
     method: "POST",
@@ -726,7 +805,7 @@ async function getActiveDownload() {
   } catch {
     return {
       ...active,
-      serviceError: "本地下载器已停止，无法获取当前任务状态。"
+      serviceError: "本地下载服务已停止，无法获取当前任务状态。"
     };
   }
 }
@@ -751,9 +830,64 @@ function emptyBatchState() {
 
 function safeBatchLogText(value) {
   return String(value || "")
-    .replace(/https?:\/\/[^\s?]+\?[^\s]+/gi, "[redacted URL]")
+    .replace(/https?:\/\/[^\s]+/gi, "[redacted URL]")
     .replace(/(cookie|authorization)\s*[:=]\s*[^\s,;]+/gi, "$1=[redacted]")
     .slice(0, 240);
+}
+
+function persistedBatchTask(task, index) {
+  return {
+    index,
+    pageUrl: typeof task?.pageUrl === "string" ? task.pageUrl : "",
+    status: typeof task?.status === "string" ? task.status : "pending",
+    pageTitle: typeof task?.pageTitle === "string" ? task.pageTitle.slice(0, 240) : "",
+    filename: typeof task?.filename === "string" ? task.filename.slice(0, 240) : "",
+    taskId: typeof task?.taskId === "string" && /^[a-f0-9]{32}$/.test(task.taskId) ? task.taskId : "",
+    bytes: Number.isFinite(task?.bytes) ? Math.max(0, Number(task.bytes)) : 0,
+    totalBytes: Number.isFinite(task?.totalBytes) ? Math.max(0, Number(task.totalBytes)) : null,
+    progress: Number.isFinite(task?.progress) ? Math.max(0, Math.min(100, Number(task.progress))) : null,
+    error: safeBatchLogText(task?.error || ""),
+    phaseStartedAt: Number.isFinite(task?.phaseStartedAt) ? Number(task.phaseStartedAt) : 0,
+    mediaScanLogged: Boolean(task?.mediaScanLogged),
+    lastCandidateLogCount: Number.isFinite(task?.lastCandidateLogCount) ? Number(task.lastCandidateLogCount) : -1,
+    lastLoggedProgressBucket: Number.isFinite(task?.lastLoggedProgressBucket) ? Number(task.lastLoggedProgressBucket) : -1
+  };
+}
+
+function persistedBatchState(state) {
+  return {
+    status: typeof state?.status === "string" ? state.status : "idle",
+    workerTabId: Number.isInteger(state?.workerTabId) ? state.workerTabId : null,
+    currentIndex: Number.isInteger(state?.currentIndex) ? Math.max(0, state.currentIndex) : 0,
+    startedAt: typeof state?.startedAt === "string" ? state.startedAt : "",
+    mediaPreference: ["auto", "screen", "speaker"].includes(state?.mediaPreference) ? state.mediaPreference : "auto",
+    statusMessage: safeBatchLogText(state?.statusMessage || ""),
+    error: safeBatchLogText(state?.error || ""),
+    tasks: Array.isArray(state?.tasks) ? state.tasks.map(persistedBatchTask) : []
+  };
+}
+
+function persistedBatchDraft(draft) {
+  const items = Array.isArray(draft?.items) ? draft.items : [];
+  return {
+    items: items
+      .filter((item) => typeof item?.url === "string" && /^https?:\/\/meeting\.tencent\.com\/(?:crm|cw)\//i.test(item.url))
+      .map((item) => ({ url: item.url })),
+    duplicateCount: Number.isFinite(draft?.duplicateCount) ? Math.max(0, Number(draft.duplicateCount)) : 0,
+    invalidCount: Number.isFinite(draft?.invalidCount) ? Math.max(0, Number(draft.invalidCount)) : 0,
+    updatedAt: typeof draft?.updatedAt === "string" ? draft.updatedAt : ""
+  };
+}
+
+function updateBatchKeepAwake(state) {
+  const shouldKeepAwake = state?.status === "running";
+  if (shouldKeepAwake && !keepAwakeRequested) {
+    chrome.power.requestKeepAwake("system");
+    keepAwakeRequested = true;
+  } else if (!shouldKeepAwake && keepAwakeRequested) {
+    chrome.power.releaseKeepAwake();
+    keepAwakeRequested = false;
+  }
 }
 
 async function appendBatchLog(event, state, message = "", details = {}) {
@@ -781,26 +915,48 @@ async function appendBatchLog(event, state, message = "", details = {}) {
 }
 
 async function getBatchDraft() {
-  const result = await chrome.storage.session.get(BATCH_DRAFT_KEY);
-  const draft = result[BATCH_DRAFT_KEY];
+  let result = await chrome.storage.local.get(BATCH_DRAFT_KEY);
+  let draft = result[BATCH_DRAFT_KEY];
+  if (!draft) {
+    const legacy = await chrome.storage.session.get(BATCH_DRAFT_KEY);
+    draft = legacy[BATCH_DRAFT_KEY];
+    if (draft) {
+      draft = persistedBatchDraft(draft);
+      await chrome.storage.local.set({ [BATCH_DRAFT_KEY]: draft });
+      await chrome.storage.session.remove(BATCH_DRAFT_KEY);
+    }
+  }
   return draft && Array.isArray(draft.items)
-    ? { items: draft.items, duplicateCount: Number(draft.duplicateCount) || 0, invalidCount: Number(draft.invalidCount) || 0, updatedAt: draft.updatedAt || "" }
+    ? persistedBatchDraft(draft)
     : { items: [], duplicateCount: 0, invalidCount: 0, updatedAt: "" };
 }
 
 async function getBatchState() {
-  const result = await chrome.storage.session.get(BATCH_STATE_KEY);
-  const saved = result[BATCH_STATE_KEY];
+  let result = await chrome.storage.local.get(BATCH_STATE_KEY);
+  let saved = result[BATCH_STATE_KEY];
+  if (!saved) {
+    const legacy = await chrome.storage.session.get(BATCH_STATE_KEY);
+    saved = legacy[BATCH_STATE_KEY];
+    if (saved) {
+      const migrated = persistedBatchState(saved);
+      await chrome.storage.local.set({ [BATCH_STATE_KEY]: migrated });
+      await chrome.storage.session.remove(BATCH_STATE_KEY);
+      saved = migrated;
+    }
+  }
   if (!saved || !Array.isArray(saved.tasks)) return emptyBatchState();
   return {
     ...emptyBatchState(),
-    ...saved,
-    tasks: saved.tasks.map((task, index) => ({ index, ...task }))
+    ...persistedBatchState(saved),
+    tasks: saved.tasks.map((task, index) => ({ index, ...persistedBatchTask(task, index) }))
   };
 }
 
 async function saveBatchState(state) {
-  await chrome.storage.session.set({ [BATCH_STATE_KEY]: state });
+  const saved = persistedBatchState(state);
+  updateBatchKeepAwake(saved);
+  await chrome.storage.local.set({ [BATCH_STATE_KEY]: saved });
+  if (saved.status === "running") await chrome.storage.session.set({ [BATCH_SESSION_KEY]: true });
   void chrome.runtime.sendMessage({ type: "batchStateChanged" }).catch(() => undefined);
 }
 
@@ -1084,7 +1240,7 @@ async function saveBatchDraft(message) {
   const existing = await getBatchState();
   if (existing.status === "running") throw new Error("批量下载正在运行，不能替换任务列表。");
   await appendBatchLog("batch_parse_received", existing, `前端提交 ${items.length} 条`);
-  await chrome.storage.session.set({ [BATCH_DRAFT_KEY]: draft });
+  await chrome.storage.local.set({ [BATCH_DRAFT_KEY]: persistedBatchDraft(draft) });
   await appendBatchLog("batch_draft_saved", existing, `后台接受 ${accepted.length} 条`);
   return { ...draft, acceptedCount: accepted.length };
 }
@@ -1101,10 +1257,10 @@ async function startBatch(message) {
   if (previous.status === "paused" && previous.tasks.length) return resumeBatch(message.mediaPreference);
   const health = await checkLocalDownloader();
   if (!health.ok) {
-    await appendBatchLog("batch_health_failed", previous, health.error || "本地下载器未启动");
-    throw new Error(health.error || "本地下载器未启动，请先运行 local_downloader.py");
+    await appendBatchLog("batch_health_failed", previous, health.error || "本地组件不可用");
+    throw new Error(health.error || "本地组件暂时不可用，请稍后重试。");
   }
-  await appendBatchLog("batch_health_ok", previous, "本地下载器可用");
+  await appendBatchLog("batch_health_ok", previous, "本地下载服务已就绪");
   const state = {
     ...emptyBatchState(),
     status: "starting",
@@ -1404,13 +1560,55 @@ chrome.alarms.onAlarm.addListener((alarm) => {
   if (alarm.name === BATCH_ALARM_NAME) void advanceBatchQueue();
 });
 
+async function recoverInterruptedBatch(state) {
+  state.workerTabId = null;
+  const current = batchTask(state);
+  if (current && current.status === "downloading" && current.taskId) {
+    try {
+      const download = await getLocalDownloadStatus(current.taskId);
+      if (download.status === "complete") {
+        Object.assign(current, {
+          status: "complete",
+          filename: download.filename || current.filename,
+          bytes: Number(download.bytes) || current.bytes,
+          totalBytes: Number.isFinite(download.totalBytes) ? download.totalBytes : current.totalBytes,
+          progress: 100,
+          error: ""
+        });
+      } else if (download.status === "failed") {
+        current.status = "failed";
+        current.error = safeBatchLogText(download.error || "本地下载失败。");
+      } else {
+        Object.assign(current, { status: "pending", taskId: "", phaseStartedAt: 0 });
+      }
+    } catch {
+      Object.assign(current, { status: "pending", taskId: "", phaseStartedAt: 0 });
+    }
+  } else if (current && !["pending", "complete", "failed"].includes(current.status)) {
+    Object.assign(current, { status: "pending", taskId: "", phaseStartedAt: 0 });
+  }
+
+  const hasUnfinishedTask = state.tasks.some((task) => !["complete", "failed"].includes(task.status));
+  state.status = hasUnfinishedTask ? "paused" : "completed";
+  state.statusMessage = hasUnfinishedTask ? "发现未完成批量任务，请点击继续。" : "批量任务已完成。";
+  await saveBatchState(state);
+}
+
 function restoreBatchQueue() {
   void (async () => {
     const state = await getBatchState();
-    if (state.status === "running") {
-      await chrome.alarms.create(BATCH_ALARM_NAME, { periodInMinutes: 0.5 });
-      queueBatchAdvance();
+    if (!["running", "starting"].includes(state.status)) {
+      updateBatchKeepAwake(state);
+      return;
     }
+    const session = await chrome.storage.session.get(BATCH_SESSION_KEY);
+    if (!session[BATCH_SESSION_KEY]) {
+      await recoverInterruptedBatch(state);
+      return;
+    }
+    updateBatchKeepAwake(state);
+    await chrome.alarms.create(BATCH_ALARM_NAME, { periodInMinutes: 0.5 });
+    queueBatchAdvance();
   })();
 }
 

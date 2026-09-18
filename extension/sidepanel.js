@@ -38,6 +38,7 @@ const toggleBatchLogsButton = document.querySelector("#toggle-batch-logs");
 const exportBatchLogsButton = document.querySelector("#export-batch-logs");
 const clearBatchLogsButton = document.querySelector("#clear-batch-logs");
 const batchLogOutput = document.querySelector("#batch-log-output");
+const localServiceStatus = document.querySelector("#local-service-status");
 
 const labels = {
   mp4: "MP4",
@@ -73,6 +74,31 @@ function showBatchFeedback(message) {
   batchFeedback.textContent = message || "";
 }
 
+function renderLocalServiceStatus(state) {
+  const messages = {
+    ready: "本地下载服务已就绪",
+    checking: "正在检查本地组件…",
+    starting: "正在启动下载服务…",
+    "not-installed": "本地组件尚未安装，请先完成一次安装。",
+    unavailable: "本地组件暂时不可用"
+  };
+  const normalized = messages[state] ? state : "unavailable";
+  localServiceStatus.dataset.state = normalized;
+  localServiceStatus.textContent = messages[normalized];
+}
+
+async function refreshLocalServiceStatus() {
+  renderLocalServiceStatus("checking");
+  try {
+    const result = await chrome.runtime.sendMessage({ type: "checkLocalDownloader" });
+    renderLocalServiceStatus(result?.ok ? "ready" : result?.state || "unavailable");
+    return result;
+  } catch {
+    renderLocalServiceStatus("unavailable");
+    return { ok: false, state: "unavailable" };
+  }
+}
+
 async function restoreCollapseState() {
   try {
     const result = await chrome.storage.session.get(COLLAPSE_STATE_KEY);
@@ -95,7 +121,7 @@ function bindCollapsible(element, key) {
 
 function safeLogExportText(value) {
   return String(value || "")
-    .replace(/https?:\/\/[^\s?]+\?[^\s]+/gi, "[redacted URL]")
+    .replace(/https?:\/\/[^\s]+/gi, "[redacted URL]")
     .replace(/(?:token|cookie|authorization|referer|origin)\s*[:=]\s*[^\s,;]+/gi, "$1=[redacted]")
     .slice(0, 240);
 }
@@ -431,7 +457,7 @@ function monitorLocalDownload(taskId) {
     if (result?.error) {
       renderDownload({
         ...(activeDownload || { taskId, filename: "MP4 文件", status: "downloading", bytes: 0 }),
-        serviceError: "本地下载器已停止，无法获取当前任务状态。"
+        serviceError: "本地下载服务已停止，无法获取当前任务状态。"
       });
       monitorTimer = setTimeout(poll, 1000);
       return;
@@ -476,12 +502,13 @@ function createCandidateCard(candidate, pageTitle, tabId) {
       renderDownload({ status: "preparing", filename: pendingFilename, bytes: 0 });
       try {
         const health = await chrome.runtime.sendMessage({ type: "checkLocalDownloader" });
+        renderLocalServiceStatus(health?.ok ? "ready" : health?.state || "unavailable");
         if (!health?.ok) {
           renderDownload({
             status: "failed",
             filename: pendingFilename,
             bytes: 0,
-            error: health?.error || "本地下载器未启动，请先运行 local_downloader.py"
+            error: health?.error || "本地组件暂时不可用，请稍后重试。"
           });
           return;
         }
@@ -612,22 +639,7 @@ clearDownloadButton.addEventListener("click", async () => {
 singleTab.addEventListener("click", () => setMode("single"));
 batchTab.addEventListener("click", () => setMode("batch"));
 
-batchFile.addEventListener("change", async () => {
-  const file = batchFile.files?.[0];
-  if (!file) return;
-  try {
-    batchLinks.value = await file.text();
-    batchSummary.textContent = "TXT 已载入，请点击“解析链接”。";
-    showBatchFeedback(`已载入 ${file.name}`);
-  } catch {
-    batchSummary.textContent = "TXT 读取失败，请确认文件是 UTF-8 文本。";
-    showBatchFeedback("TXT 读取失败，请确认文件是 UTF-8 文本。");
-  }
-});
-
-parseBatchButton.addEventListener("click", async () => {
-  parseBatchButton.disabled = true;
-  showBatchFeedback("正在解析链接…");
+async function parseAndSaveBatchDraft() {
   const result = parseBatchLinks(batchLinks.value);
   try {
     const draft = await chrome.runtime.sendMessage({
@@ -645,9 +657,37 @@ parseBatchButton.addEventListener("click", async () => {
     renderBatchDraft(draft);
     await refreshBatchLogs();
     showBatchFeedback(result.items.length ? `已解析 ${result.items.length} 条链接。` : "当前没有可处理的腾讯会议链接。");
+    parseBatchButton.textContent = "重新解析";
+    return true;
   } catch (error) {
     batchSummary.textContent = error.message || "解析链接失败。";
     showBatchFeedback("解析失败，请检查链接格式。");
+    return false;
+  }
+}
+
+batchFile.addEventListener("change", async () => {
+  const file = batchFile.files?.[0];
+  if (!file) return;
+  parseBatchButton.disabled = true;
+  showBatchFeedback("正在读取并解析 TXT…");
+  try {
+    batchLinks.value = await file.text();
+    const parsed = await parseAndSaveBatchDraft();
+    if (parsed) showBatchFeedback(batchDraft.items?.length ? `已从 ${file.name} 自动解析 ${batchDraft.items.length} 条链接。` : "TXT 中没有可处理的腾讯会议链接。");
+  } catch {
+    batchSummary.textContent = "TXT 读取失败，请确认文件是 UTF-8 文本。";
+    showBatchFeedback("TXT 读取失败，请确认文件是 UTF-8 文本。");
+  } finally {
+    parseBatchButton.disabled = false;
+  }
+});
+
+parseBatchButton.addEventListener("click", async () => {
+  parseBatchButton.disabled = true;
+  showBatchFeedback("正在解析链接…");
+  try {
+    await parseAndSaveBatchDraft();
   } finally {
     parseBatchButton.disabled = false;
   }
@@ -658,6 +698,7 @@ startBatchButton.addEventListener("click", async () => {
   batchProgress.hidden = false;
   batchStatus.textContent = "正在启动批量任务…";
   showBatchFeedback("正在启动批量任务…");
+  renderLocalServiceStatus("starting");
   try {
     const state = await chrome.runtime.sendMessage({
       type: "startBatch",
@@ -672,6 +713,7 @@ startBatchButton.addEventListener("click", async () => {
     batchSummary.textContent = error.message || "批量启动失败。";
     showBatchFeedback("批量启动失败，请查看运行日志。");
     await refreshBatchLogs();
+    await refreshLocalServiceStatus();
   } finally {
     startBatchButton.disabled = false;
   }
@@ -789,6 +831,7 @@ chrome.runtime.onMessage.addListener((message) => {
     });
   }
   if (message?.type === "batchLogChanged" && !batchLogOutput.hidden) void refreshBatchLogs();
+  if (message?.type === "localDownloaderStateChanged") renderLocalServiceStatus(message.state);
 });
 
 refreshButton.addEventListener("click", refresh);
@@ -805,6 +848,7 @@ void restoreCollapseState().then(() => {
       renderBatchState(state);
       if (["starting", "running"].includes(state.status) || state.tasks?.[state.currentIndex]?.status === "downloading") monitorBatchState();
     }
+    void refreshLocalServiceStatus();
     void refresh();
   });
 });

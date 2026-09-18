@@ -120,6 +120,42 @@ button:disabled {
   white-space: nowrap;
 }
 
+.local-service-status::before {
+  display: inline-block;
+  width: 7px;
+  height: 7px;
+  margin-right: 5px;
+  border-radius: 50%;
+  content: "";
+  background: #98a2b3;
+}
+
+.local-service-status[data-state="ready"] {
+  border-color: #cdebdc;
+  color: #277a56;
+  background: #f2fbf6;
+}
+
+.local-service-status[data-state="ready"]::before {
+  background: #2d9a67;
+}
+
+.local-service-status[data-state="starting"]::before,
+.local-service-status[data-state="checking"]::before {
+  background: #e49b25;
+}
+
+.local-service-status[data-state="not-installed"] {
+  border-color: #f2d7b6;
+  color: #9a5d11;
+  background: #fff8ec;
+}
+
+.local-service-status[data-state="not-installed"]::before,
+.local-service-status[data-state="unavailable"]::before {
+  background: #d05a51;
+}
+
 .mode-tabs {
   display: grid;
   grid-template-columns: 1fr 1fr;

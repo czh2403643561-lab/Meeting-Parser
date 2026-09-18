@@ -24,24 +24,29 @@
 - 已修复批量安全日志导出：UTF-8 文本、时间戳文件名、空日志提示和敏感字段过滤
 - 已完成 Side Panel 第一轮 UI/交互整理：单个下载高级信息折叠、批量总览/进度/任务列表/日志分层、操作反馈和会话内折叠状态记忆
 - 已增加 16/32/48/128 PNG 扩展图标，并更新 manifest 配置
+- 已真实验证 3 条腾讯会议链接的连续批量下载成功
+- 已修复本地下载器客户端提前断开时的响应写入处理，保留 ThreadingHTTPServer，并增加空闲 15 分钟自动退出
+- 已新增 Windows Companion 打包方案、Native Messaging Host、当前用户 Chrome/Edge 安装与卸载脚本，以及固定扩展 ID
+- 已接入插件自动确保本地下载服务可用、批量运行防休眠、TXT 自动解析和批量非敏感状态本地恢复
+- 已构建并验证两个 Companion EXE：Native Host 可拉起下载器、健康检查可用、空闲后退出
 
 ## 当前
 
-- 核心下载链路未改动，继续使用 Side Panel + 本地 Python 下载器方案
-- 日志导出与 UI 第一轮整理已完成，待在浏览器重新加载 `extension/` 后做回归验证
+- 核心下载链路未改动，继续使用 Side Panel + 本地下载服务方案
+- 本地 Python 下载器仍保留为开发调试实现；普通用户流程已改为由插件自动启动 Windows Companion
+- Companion 与浏览器 Native Messaging 的完整真实端到端流程尚待在重新加载的 Chrome/Edge 扩展中验证，不能视为“一键体验已真实完成”
 
 ## 问题
 
 - Chrome 直接下载对该腾讯会议 MP4 的真实验证失败，不能继续作为主下载链路
 - 多 MP4 用途显示和页面切换隔离尚待真实腾讯会议页面复测
-- 本轮 UI、日志导出和图标尚未在真实 Chrome Side Panel 中完成最终回归
-- 批量 worker tab 的连续导航、暂停恢复和失败后继续仍需真实 3 条链接复测
+- 本轮 UI、日志导出、Companion、Native Messaging 和浏览器重启恢复尚未在真实 Chrome/Edge Side Panel 中完成最终回归
+- 需验证杀掉 Companion 后插件可自动再次拉起，以及批量暂停/完成时能释放防休眠
 - Chrome/Edge 现在应加载 `extension/` 目录，不应加载仓库根目录
 
 ## 下一步
 
-- 重新加载 `extension/`，验证日志导出、无日志提示、候选高级信息折叠和图标显示
-- 先导入 3 条腾讯会议链接，确认后台草稿接受数量、worker tab 创建和运行日志均正确
-- 关闭并重开 Side Panel，确认批量状态和当前下载进度恢复
-- 测试暂停、继续、关闭 worker tab 后继续，以及失败项重试
-- 3 条连续成功后，再运行完整 67 条列表
+- 运行 `scripts\build_companion.ps1` 与 `installer\install_companion.ps1`，重新加载 `extension/`
+- 在无手工 Python/PowerShell 的前提下验证单条下载和杀掉 Companion 后的批量自动拉起
+- 验证批量运行防休眠、暂停/完成释放，以及浏览器重启后“发现未完成批量任务，点击继续”
+- 完成后再运行完整 67 条列表

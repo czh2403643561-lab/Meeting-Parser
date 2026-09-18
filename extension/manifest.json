@@ -2,8 +2,9 @@
   "manifest_version": 3,
   "name": "Media Resource Finder",
   "version": "0.5.0",
+  "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAsRnTbnB5uhYkMXZ76s0XKdEdrLqO6BU+L0WhtlPENve5frW+maLU46BXOAf/iVb8S9s70AHIbWoqWvndlGdCNmtcYOOr79M4UPh9Am7iQIijOxS7HHSrgtmdZCIrNDDRuhN1n3duGU0IuDw3eyIImVCsLE6RWE69pQYdVvsPWTP7mPIHVS2TBLtaZrKu6yTgbtoHHj+PA1kQt8QF/o70KaHFUTrWTkKFi3vIfg8SvUG/s8+zUR9kfaRpWUbpNPJ9vpREpXPK5rspFiqeDpQmPE1za9EFmPySnK72yeIa+730ixqzH11x/o/iuyZJzOCdcf67mKrsfBTSX1cDF8Qw0wIDAQAB",
   "description": "Detect media requests and manage direct MP4 downloads in a persistent side panel.",
-  "permissions": ["activeTab", "storage", "webRequest", "sidePanel", "cookies", "tabs", "alarms", "downloads"],
+  "permissions": ["activeTab", "storage", "webRequest", "sidePanel", "cookies", "tabs", "alarms", "downloads", "nativeMessaging", "power"],
   "host_permissions": ["<all_urls>", "http://127.0.0.1:8765/*"],
   "background": {
     "service_worker": "background.js"
