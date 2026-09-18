@@ -2,30 +2,28 @@
 
 ## 已完成
 
-- 单条 MP4 和串行批量下载核心保持原方案，下载目录仍为用户 Downloads。
-- 新增代码级 `MeetingParserHost.exe`：通过持久 Native Messaging 连接直接复用安全流式下载实现，不再启动 localhost Downloader 子进程。
-- Native Host 仅传输 hello、任务参数和进度 JSON，不回传 MP4 字节；状态不包含完整 URL、Cookie 或 Authorization。
-- 扩展后台已改用 `chrome.runtime.connectNative`，单条和批量共用同一提交与状态入口；Native 断线时当前任务标记失败，不自动重复下载。
-- 安装器已改为安装 `MeetingParserHost.exe`，升级前只停止本项目明确进程，清理旧 Downloader/旧 Native Host，并禁用通用应用强制关闭流程。
-- 安装/更新模式会断开现有 Native 连接，阻止下载进行中更新，并使用低频探测等待安装完成。
-- `local_downloader.py` 保留为开发调试 HTTP 服务；其安全校验、重定向脱敏、文件命名和流式下载逻辑由新 Host 复用。
-- 已补充 Native Host 协议测试、敏感字段检查、文件命名测试；`scripts/build_setup.ps1` 已成功生成 `dist/release/MeetingParserSetup.exe`。
-- README 已区分普通用户 Native Host 流程与开发者 Python 调试流程。
+- 单条 MP4 和串行批量下载核心、Native Host、腾讯会议解析逻辑未修改。
+- 新增 `.github/workflows/release.yml`：`v*` 标签构建并发布正式 Release，`workflow_dispatch` 只上传 Actions artifact。
+- 修正 Companion 构建脚本，使 workflow 使用 Python 3.12 时不会错误追加 `-3` 参数。
+- 扩展新增安装包可用性检查：未发布和网络不可用时不创建 Chrome 失败下载项，并显示普通用户提示。
+- 安装包下载改为通过 `chrome.downloads.onChanged` 等待真实完成或中断状态。
+- `v0.6.3` GitHub Actions 已成功完成，Release asset 严格命名为 `MeetingParserSetup.exe`。
+- `releases/latest/download/MeetingParserSetup.exe` 已验证返回 200、`application/octet-stream`，大小约 10.98 MB。
+- Setup、Host、扩展版本和 `MIN_COMPANION_VERSION` 仍保持 0.6.0 兼容。
 
 ## 当前
 
-- 本轮完成的是代码级 Companion 架构迁移，正式链路尚不能写成“已真实完成”。
-- PowerShell 安装脚本、Inno Setup 配置、扩展后台和 Side Panel 已同步到 Host 0.6.0 协议。
-- 现有安装目录/注册表可能仍是旧 Companion，需要在真实升级测试中确认覆盖与清理结果。
+- GitHub Release 发布链路和 latest 直链已真实可用。
+- 扩展代码已完成本地语法、现有协议/命名测试，并用 Python 3.12 成功构建 Companion EXE。
+- 本轮尚未把“浏览器插件 Side Panel 点击安装本地组件后的最终 UI 提示”写成已验证完成。
 
 ## 问题
 
-- 尚未在干净 Windows 环境完成“无 Python/PowerShell → 安装 Setup → Chrome/Edge Side Panel → 单条完整下载”的真实端到端验证。
-- 尚未完成旧 Companion 正在运行时的真实覆盖升级验证，也未确认浏览器重启、批量暂停/完成防休眠释放等回归。
-- 需要确认真实腾讯会议页面的标题提取、单条/批量命名和重名冲突行为未受本轮通信层迁移影响。
+- 当前浏览器自动化无法操作 `chrome://extensions` 刷新已加载的本地扩展，也无法稳定捕获 `.exe` 下载完成事件。
+- 因此尚未完成插件界面层面的“点击安装本地组件 → Chrome 下载完成 → 显示成功提示”闭环验收。
+- 工作区中的未跟踪 `MeetingParser/` 安装目录为已有用户文件，本轮未修改、未提交。
 
 ## 下一步
 
-- 在真实 Chrome/Edge 中加载 `extension/`，安装新版 Setup 并验证 Native Host hello、单条下载和 3 条批量下载。
-- 关闭/杀掉 Host 后重新下载，确认扩展能重新建立 Native 连接；验证下载期间升级会被阻止，空闲升级不会再出现文件占用提示。
-- 完成浏览器重启恢复、防休眠、敏感信息和长文件名回归后，再更新状态为真实验证完成。
+- 在 Chrome 扩展管理页手动刷新本地扩展后，点击“安装本地组件”，确认下载完成提示为“安装程序已下载，请运行 MeetingParserSetup.exe”。
+- 该浏览器验收通过后，再将状态更新为真实验证完成；Native Host 安装后的完整功能测试另行进行。
