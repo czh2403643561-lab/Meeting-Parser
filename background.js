@@ -18,6 +18,7 @@ const ACTIVE_DOWNLOAD_KEY = "activeDownload";
 const candidateIdsByUrl = new Map();
 const candidateUrlsById = new Map();
 const tabPageStates = new Map();
+const pageRequestInfoByTab = new Map();
 
 if (chrome.sidePanel?.setPanelBehavior) {
   void chrome.sidePanel.setPanelBehavior({ openPanelOnActionClick: true });
@@ -56,6 +57,7 @@ function clearTabMemory(tabId) {
   for (const [key, context] of requestContexts) {
     if (context.tabId === tabId) requestContexts.delete(key);
   }
+  pageRequestInfoByTab.delete(tabId);
 }
 
 async function initializeTabPageState(tabId) {
@@ -75,7 +77,7 @@ async function activatePageScope(tabId, pageScope) {
   const previous = await initializeTabPageState(tabId);
   if (previous.scope === pageScope) return previous;
 
-  const next = { scope: pageScope, generation: previous.generation + 1 };
+  const next = { scope: pageScope, generation: previous.generation + 1, documentId: "" };
   tabPageStates.set(tabId, next);
   clearTabMemory(tabId);
   void chrome.runtime.sendMessage({ type: "pageScopeChanged", tabId }).catch(() => undefined);
@@ -90,11 +92,22 @@ async function activatePageScope(tabId, pageScope) {
   return next;
 }
 
-async function pageStateForRequest(tabId, pageScope) {
-  if (!pageScope) return null;
+function originFromUrl(value) {
+  try {
+    return new URL(value).origin;
+  } catch {
+    return "";
+  }
+}
+
+async function pageStateForRequest(tabId, details) {
   const current = await initializeTabPageState(tabId);
-  if (current.scope && current.scope !== pageScope) return null;
-  return current.scope === pageScope ? current : activatePageScope(tabId, pageScope);
+  if (!current.scope) return null;
+  if (details.documentId && current.documentId && details.documentId !== current.documentId) return null;
+
+  const initiatorOrigin = originFromUrl(details.initiator);
+  if (initiatorOrigin && initiatorOrigin !== originFromUrl(current.scope)) return null;
+  return current;
 }
 
 function normalizeUrl(value) {
@@ -132,9 +145,22 @@ function newCandidateId() {
   return `media-${Date.now()}-${Math.random().toString(36).slice(2)}`;
 }
 
+function stableMediaIdentity(value) {
+  try {
+    const url = new URL(value);
+    return `${url.origin}${url.pathname}`;
+  } catch {
+    return "";
+  }
+}
+
+function mediaKey(tabId, url) {
+  return `${tabId}:${stableMediaIdentity(url)}`;
+}
+
 function candidateIdForUrl(tabId, url) {
   const normalized = normalizeUrl(url);
-  const key = requestContextKey(tabId, normalized);
+  const key = mediaKey(tabId, normalized);
   let id = candidateIdsByUrl.get(key);
   if (!id) {
     id = newCandidateId();
@@ -201,7 +227,7 @@ function mediaDetails(url) {
 }
 
 function requestContextKey(tabId, url) {
-  return `${tabId}:${normalizeUrl(url)}`;
+  return mediaKey(tabId, url);
 }
 
 function inspectContextHeaders(headers = []) {
@@ -254,26 +280,17 @@ function pruneRequestContexts() {
   }
 }
 
-function pageScopeForRequest(details) {
-  return (
-    pageScopeFromUrl(details.documentUrl) ||
-    pageScopeFromUrl(details.initiator) ||
-    tabPageStates.get(details.tabId)?.scope ||
-    ""
-  );
-}
-
 async function rememberRequestContext(details) {
   if (details.tabId < 0 || !isHttpUrl(details.url)) return;
   const kind = detectMediaKind(details.url);
   if (!kind && details.type !== "media") return;
-  const pageScope = pageScopeForRequest(details);
-  const state = await pageStateForRequest(details.tabId, pageScope);
-  if (!state || !isCurrentPage(details.tabId, pageScope, state.generation)) return;
+  const state = await pageStateForRequest(details.tabId, details);
+  if (!state || !isCurrentPage(details.tabId, state.scope, state.generation)) return;
 
   const inspected = inspectContextHeaders(details.requestHeaders);
   if (!Object.keys(inspected.selected).length && !Object.values(inspected.sensitive).some(Boolean)) return;
 
+  candidateIdForUrl(details.tabId, details.url);
   const key = requestContextKey(details.tabId, details.url);
   const previous = requestContexts.get(key);
   requestContexts.set(key, {
@@ -286,11 +303,11 @@ async function rememberRequestContext(details) {
       ...inspected.sensitive
     },
     requestId: details.requestId,
-    pageScope,
+    pageScope: state.scope,
     generation: state.generation,
     updatedAt: Date.now()
   });
-  void updateCandidateContext(details.tabId, details.url, pageScope, state.generation, requestContexts.get(key));
+  void updateCandidateContext(details.tabId, details.url, state.scope, state.generation, requestContexts.get(key));
   pruneRequestContexts();
 }
 
@@ -316,30 +333,45 @@ function moreSpecificKind(current, next) {
 async function getCandidates(tabId) {
   const state = await initializeTabPageState(tabId);
   const result = await chrome.storage.session.get(candidatesKey(tabId));
-  const stored = Array.isArray(result[candidatesKey(tabId)])
-    ? result[candidatesKey(tabId)].filter((candidate) => candidate.pageScope === state.scope)
-    : [];
-  let migrated = false;
-  const candidates = stored.map((candidate) => {
-    if (candidate.id) return candidate;
-    migrated = true;
-    const id = isHttpUrl(candidate.url) ? candidateIdForUrl(tabId, candidate.url) : newCandidateId();
-    return {
-      ...candidate,
-      id,
-      url: redactedUrl(candidate.url),
-      pageScope: state.scope,
-      contextReady: false
-    };
-  });
+  const allStored = Array.isArray(result[candidatesKey(tabId)]) ? result[candidatesKey(tabId)] : [];
+  const scoped = allStored.filter((candidate) => candidate.pageScope === state.scope);
+  let changed = scoped.length !== allStored.length;
+  const byStableMedia = new Map();
 
-  if (migrated) {
-    await chrome.storage.session.set({ [candidatesKey(tabId)]: candidates });
+  for (const rawCandidate of scoped) {
+    const candidate = rawCandidate.id
+      ? rawCandidate
+      : {
+          ...rawCandidate,
+          id: newCandidateId(),
+          url: redactedUrl(rawCandidate.url),
+          pageScope: state.scope,
+          contextReady: false
+        };
+    if (!rawCandidate.id) changed = true;
+
+    const stable = stableMediaIdentity(candidate.url) || candidate.id;
+    const existing = byStableMedia.get(stable);
+    if (existing) {
+      changed = true;
+      existing.sources = [...new Set([...(existing.sources || []), ...(candidate.sources || [])])];
+      existing.contextReady = Boolean(existing.contextReady || candidate.contextReady);
+      existing.context = existing.context || candidate.context;
+      existing.lastSeen = existing.lastSeen || candidate.lastSeen;
+      continue;
+    }
+    byStableMedia.set(stable, candidate);
   }
 
+  const candidates = [...byStableMedia.values()];
+  for (const candidate of candidates) {
+    candidateIdsByUrl.set(mediaKey(tabId, candidate.url), candidate.id);
+  }
+  if (changed) await chrome.storage.session.set({ [candidatesKey(tabId)]: candidates });
+
   return candidates.map((candidate) => {
-    const actualUrl = candidateUrlsById.get(candidate.id);
-    const context = actualUrl ? getRequestContext(tabId, actualUrl) : undefined;
+    const actualUrl = candidateUrlsById.get(candidate.id) || candidate.url;
+    const context = getRequestContext(tabId, actualUrl);
     return {
       ...candidate,
       context: contextPresence(context) || candidate.context,
@@ -404,6 +436,7 @@ function upsertCandidate(tabId, incoming) {
     if (existing) {
       existing.kind = moreSpecificKind(existing.kind, incoming.kind);
       existing.contentType = incoming.contentType || existing.contentType || "";
+      existing.url = redactedUrl(url);
       existing.sources = [...new Set([...(existing.sources || []), incoming.source])];
       existing.context = contextPresence(context);
       existing.contextReady = hasUsableRequestContext(context);
@@ -445,16 +478,15 @@ async function observeRequest(details, contentType = "") {
 
   const kind = detectMediaKind(details.url, contentType);
   if (!kind && details.type !== "media") return;
-  const pageScope = pageScopeForRequest(details);
-  const state = await pageStateForRequest(details.tabId, pageScope);
-  if (!state || !isCurrentPage(details.tabId, pageScope, state.generation)) return;
+  const state = await pageStateForRequest(details.tabId, details);
+  if (!state || !isCurrentPage(details.tabId, state.scope, state.generation)) return;
 
   void upsertCandidate(details.tabId, {
     url: details.url,
     kind: kind || "other",
     contentType,
     source: "network",
-    pageScope,
+    pageScope: state.scope,
     generation: state.generation
   });
 }
@@ -537,21 +569,95 @@ async function checkLocalDownloader() {
   }
 }
 
+function notifyDownloadStage(tabId, candidateId, stage) {
+  void chrome.runtime.sendMessage({ type: "downloadPreparation", tabId, candidateId, stage }).catch(() => undefined);
+}
+
+function fallbackContext(tabId, url, state, pageInfo, cookies) {
+  if (!pageInfo || pageInfo.scope !== state.scope || pageInfo.generation !== state.generation) return null;
+  const headers = {};
+  if (isHttpUrl(pageInfo.url)) headers.referer = pageInfo.url;
+  if (pageInfo.userAgent) headers["user-agent"] = pageInfo.userAgent;
+  const cookieHeader = cookies.map((cookie) => `${cookie.name}=${cookie.value}`).join("; ");
+  if (cookieHeader && cookieHeader.length <= 8192) headers.cookie = cookieHeader;
+  if (!headers.referer) return null;
+  return {
+    tabId,
+    url: normalizeUrl(url),
+    headers,
+    sensitive: { cookie: Boolean(headers.cookie), authorization: false },
+    pageScope: state.scope,
+    generation: state.generation,
+    updatedAt: Date.now()
+  };
+}
+
+async function buildFallbackContext(tabId, url) {
+  const state = await initializeTabPageState(tabId);
+  const pageInfo = pageRequestInfoByTab.get(tabId);
+  if (!state.scope || !pageInfo) return null;
+  let cookies = [];
+  try {
+    cookies = await chrome.cookies.getAll({ url });
+  } catch {
+    cookies = [];
+  }
+  return fallbackContext(tabId, url, state, pageInfo, cookies);
+}
+
+function waitFor(milliseconds) {
+  return new Promise((resolve) => setTimeout(resolve, milliseconds));
+}
+
+async function prepareNetworkContext(tabId, url) {
+  let mediaPathname = "";
+  try {
+    mediaPathname = new URL(url).pathname;
+  } catch {
+    return null;
+  }
+  try {
+    await chrome.tabs.sendMessage(tabId, {
+      type: "prepareMediaContext",
+      mediaPathname,
+      timeoutMs: 4000
+    });
+  } catch {
+    return null;
+  }
+
+  for (let attempt = 0; attempt < 6; attempt += 1) {
+    const context = getRequestContext(tabId, url);
+    if (hasUsableRequestContext(context)) return context;
+    await waitFor(250);
+  }
+  return null;
+}
+
 async function startLocalDownload(message) {
   const url = candidateUrlsById.get(message.candidateId);
   if (!url || !Number.isInteger(message.tabId)) {
-    throw new Error("未捕获播放器请求上下文，请重新播放视频后再试。");
+    throw new Error("未获取当前媒体地址，请刷新页面后再试。");
   }
   if (detectMediaKind(url, message.contentType) !== "mp4") {
     throw new Error("该资源不是可直接下载的 MP4。");
   }
 
-  const context = getRequestContext(message.tabId, url);
+  notifyDownloadStage(message.tabId, message.candidateId, "preparing");
+  let context = getRequestContext(message.tabId, url);
   if (!hasUsableRequestContext(context)) {
-    throw new Error("未捕获播放器请求上下文，请重新播放视频后再试。");
+    context = await buildFallbackContext(message.tabId, url);
+  }
+  if (!hasUsableRequestContext(context)) {
+    context = await prepareNetworkContext(message.tabId, url);
+  }
+  if (!hasUsableRequestContext(context)) {
+    throw new Error("自动准备失败，请播放视频后重试。");
   }
 
+  notifyDownloadStage(message.tabId, message.candidateId, "connecting");
   await localDownloaderRequest("/health");
+  notifyDownloadStage(message.tabId, message.candidateId, "submitting");
   const result = await localDownloaderRequest("/download", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
@@ -611,26 +717,38 @@ async function clearActiveDownload() {
   return { ok: true };
 }
 
-async function savePageMetadata(tabId, metadata, senderPageUrl = "") {
+async function savePageMetadata(tabId, metadata, senderPageUrl = "", senderDocumentId = "") {
   const pageScope = pageScopeFromUrl(metadata.pageUrl);
   const senderScope = pageScopeFromUrl(senderPageUrl);
   const knownState = await initializeTabPageState(tabId);
   if (knownState.scope && knownState.scope !== pageScope && senderScope !== pageScope) return;
   const state = await activatePageScope(tabId, pageScope);
   if (!state || !isCurrentPage(tabId, pageScope, state.generation)) return;
+  const boundState = {
+    ...state,
+    documentId: typeof senderDocumentId === "string" ? senderDocumentId : ""
+  };
+  tabPageStates.set(tabId, boundState);
+  pageRequestInfoByTab.set(tabId, {
+    url: metadata.pageUrl,
+    userAgent: typeof metadata.userAgent === "string" ? metadata.userAgent.slice(0, 512) : "",
+    scope: pageScope,
+    generation: boundState.generation,
+    documentId: boundState.documentId
+  });
   const current = await getPageInfo(tabId);
-  if (!isCurrentPage(tabId, pageScope, state.generation)) return;
+  if (!isCurrentPage(tabId, pageScope, boundState.generation)) return;
   await queueTabWrite(tabId, async () => {
-    if (!isCurrentPage(tabId, pageScope, state.generation)) return;
+    if (!isCurrentPage(tabId, pageScope, boundState.generation)) return;
     await setPageInfo(tabId, {
       url: redactedUrl(metadata.pageUrl),
       title: metadata.pageTitle || current.title || "",
       scope: pageScope,
-      generation: state.generation,
+      generation: boundState.generation,
       updatedAt: new Date().toISOString()
     });
   });
-  if (!isCurrentPage(tabId, pageScope, state.generation)) return;
+  if (!isCurrentPage(tabId, pageScope, boundState.generation)) return;
 
   for (const url of metadata.videoUrls || []) {
     if (!isHttpUrl(url)) continue;
@@ -641,7 +759,7 @@ async function savePageMetadata(tabId, metadata, senderPageUrl = "") {
         kind,
         source: "video element",
         pageScope,
-        generation: state.generation
+        generation: boundState.generation
       });
     }
   }
@@ -649,7 +767,7 @@ async function savePageMetadata(tabId, metadata, senderPageUrl = "") {
 
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   if (message?.type === "pageMetadata" && sender.tab?.id >= 0) {
-    savePageMetadata(sender.tab.id, message, sender.tab.url).catch(() => undefined);
+    savePageMetadata(sender.tab.id, message, sender.tab.url, sender.documentId).catch(() => undefined);
     return;
   }
 

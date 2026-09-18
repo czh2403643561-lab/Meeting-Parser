@@ -34,6 +34,7 @@ const variantLabels = {
 let activeDownload = null;
 let monitorTimer = null;
 let monitorToken = 0;
+let pendingFilename = "";
 
 function activeTab() {
   return chrome.tabs.query({ active: true, lastFocusedWindow: true }).then(([tab]) => tab);
@@ -107,9 +108,9 @@ function parseBatchLinks(text) {
 
 function renderBatchItems(items) {
   batchList.replaceChildren();
-  for (const [index, item] of items.entries()) {
+  for (const item of items) {
     const row = document.createElement("li");
-    row.textContent = `${index + 1}. ${truncateUrl(item.url)}`;
+    row.textContent = truncateUrl(item.url);
     row.title = item.url;
     const state = document.createElement("small");
     state.textContent = item.status || "待处理";
@@ -166,6 +167,7 @@ function downloadLabel(status) {
   if (status.serviceError) return status.serviceError;
   if (status.status === "complete") return `下载完成：${status.filename || "MP4 文件"}`;
   if (status.status === "failed") return `下载失败：${status.error || "本地下载器报告失败。"}`;
+  if (status.status === "preparing") return "正在准备下载上下文…";
   if (status.status === "queued") return "下载已开始";
   if (status.status === "connecting") return "正在连接本地下载器…";
   if (status.status === "submitting") return "正在提交任务…";
@@ -279,20 +281,20 @@ function createCandidateCard(candidate, pageTitle, tabId) {
     download.textContent = "下载 MP4";
     download.addEventListener("click", async () => {
       download.disabled = true;
-      renderDownload({ status: "connecting", filename: `${pageTitle || "media"}.mp4`, bytes: 0 });
+      pendingFilename = `${pageTitle || "media"}.mp4`;
+      renderDownload({ status: "preparing", filename: pendingFilename, bytes: 0 });
       try {
         const health = await chrome.runtime.sendMessage({ type: "checkLocalDownloader" });
         if (!health?.ok) {
           renderDownload({
             status: "failed",
-            filename: `${pageTitle || "media"}.mp4`,
+            filename: pendingFilename,
             bytes: 0,
             error: health?.error || "本地下载器未启动，请先运行 local_downloader.py"
           });
           return;
         }
 
-        renderDownload({ status: "submitting", filename: `${pageTitle || "media"}.mp4`, bytes: 0 });
         const result = await chrome.runtime.sendMessage({
           type: "downloadMp4",
           candidateId: candidate.id,
@@ -303,7 +305,7 @@ function createCandidateCard(candidate, pageTitle, tabId) {
         if (result?.error) {
           renderDownload({
             status: "failed",
-            filename: result.filename || `${pageTitle || "media"}.mp4`,
+            filename: result.filename || pendingFilename,
             bytes: 0,
             error: result.error
           });
@@ -318,12 +320,13 @@ function createCandidateCard(candidate, pageTitle, tabId) {
           totalBytes: null,
           progress: null
         };
+        pendingFilename = result.filename || pendingFilename;
         renderDownload(activeDownload);
         monitorLocalDownload(result.taskId);
       } catch (error) {
         renderDownload({
           status: "failed",
-          filename: `${pageTitle || "media"}.mp4`,
+          filename: pendingFilename,
           bytes: 0,
           error: error.message || "本地下载器通信失败。"
         });
@@ -424,6 +427,13 @@ parseBatchButton.addEventListener("click", async () => {
 });
 
 chrome.runtime.onMessage.addListener((message) => {
+  if (message?.type === "downloadPreparation") {
+    void activeTab().then((tab) => {
+      if (tab?.id === message.tabId) {
+        renderDownload({ status: message.stage, filename: pendingFilename || "MP4 文件", bytes: 0 });
+      }
+    });
+  }
   if (message?.type === "pageScopeChanged") {
     void activeTab().then((tab) => {
       if (tab?.id === message.tabId) void refresh();

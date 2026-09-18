@@ -43,8 +43,51 @@ function sendMetadata() {
     type: "pageMetadata",
     pageUrl: location.href,
     pageTitle: document.title,
+    userAgent: navigator.userAgent,
     videoUrls: collectVideoUrls()
   });
+}
+
+function pathnameFor(value) {
+  const url = toAbsoluteHttpUrl(value);
+  if (!url) return "";
+  try {
+    return new URL(url).pathname;
+  } catch {
+    return "";
+  }
+}
+
+function videoMatchesPathname(video, mediaPathname) {
+  const values = [video.currentSrc, video.src, video.getAttribute("src")];
+  for (const source of video.querySelectorAll("source")) {
+    values.push(source.src, source.getAttribute("src"));
+  }
+  return values.some((value) => pathnameFor(value) === mediaPathname);
+}
+
+async function prepareMediaContext(mediaPathname, timeoutMs = 4000) {
+  if (typeof mediaPathname !== "string" || !mediaPathname) return { prepared: false };
+  const video = [...document.querySelectorAll("video")].find((item) => videoMatchesPathname(item, mediaPathname));
+  if (!video) return { prepared: false };
+
+  video.preload = "metadata";
+  if (!video.paused) return { prepared: true };
+
+  await new Promise((resolve) => {
+    let timer;
+    const finish = () => {
+      clearTimeout(timer);
+      video.removeEventListener("loadedmetadata", finish);
+      video.removeEventListener("error", finish);
+      resolve();
+    };
+    timer = setTimeout(finish, Math.min(Math.max(timeoutMs, 3000), 5000));
+    video.addEventListener("loadedmetadata", finish, { once: true });
+    video.addEventListener("error", finish, { once: true });
+    video.load();
+  });
+  return { prepared: true };
 }
 
 let timer;
@@ -61,9 +104,18 @@ new MutationObserver(scheduleMetadata).observe(document.documentElement, {
   characterData: true
 });
 
-chrome.runtime.onMessage.addListener((message) => {
+chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
   if (message?.type === "scanPageMedia") {
     sendMetadata();
+  }
+  if (message?.type === "prepareMediaContext") {
+    prepareMediaContext(message.mediaPathname, message.timeoutMs)
+      .then((result) => {
+        sendMetadata();
+        sendResponse(result);
+      })
+      .catch(() => sendResponse({ prepared: false }));
+    return true;
   }
 });
 
