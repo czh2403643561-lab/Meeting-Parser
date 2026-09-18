@@ -36,7 +36,7 @@ jobs:
 
       - name: Build setup executable
         shell: powershell
-        run: powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\scripts\build_setup.ps1
+        run: powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\scripts\build_setup.ps1 -Python python
 
       - name: Verify setup executable
         shell: powershell
