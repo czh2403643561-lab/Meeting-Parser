@@ -6,21 +6,27 @@ $ErrorActionPreference = "Stop"
 . (Join-Path $PSScriptRoot "companion.config.ps1")
 
 $installDirectory = Join-Path $env:LOCALAPPDATA $MeetingParserInstallDirectoryName
-$downloaderPath = Join-Path $installDirectory "MeetingParserDownloader.exe"
+$ownedExecutables = @(
+  (Join-Path $installDirectory "MeetingParserHost.exe"),
+  (Join-Path $installDirectory "MeetingParserNativeHost.exe"),
+  (Join-Path $installDirectory "MeetingParserDownloader.exe")
+)
 $registryKeys = @(
   "HKCU:\Software\Google\Chrome\NativeMessagingHosts\$MeetingParserNativeHostName",
   "HKCU:\Software\Microsoft\Edge\NativeMessagingHosts\$MeetingParserNativeHostName"
 )
 
-try {
-  $runningDownloaders = Get-CimInstance Win32_Process -Filter "Name='MeetingParserDownloader.exe'" |
-    Where-Object { $_.ExecutablePath -eq $downloaderPath }
-} catch {
-  $runningDownloaders = @()
-}
-foreach ($process in $runningDownloaders) {
-  if ($PSCmdlet.ShouldProcess($downloaderPath, "停止正在运行的本地下载服务")) {
-    Stop-Process -Id $process.ProcessId -Force
+foreach ($ownedExecutable in $ownedExecutables) {
+  try {
+    $runningProcesses = Get-CimInstance Win32_Process -Filter "Name='$([IO.Path]::GetFileName($ownedExecutable))'" |
+      Where-Object { $_.ExecutablePath -eq $ownedExecutable }
+  } catch {
+    $runningProcesses = @()
+  }
+  foreach ($process in $runningProcesses) {
+    if ($PSCmdlet.ShouldProcess($ownedExecutable, "停止正在运行的本地组件")) {
+      Stop-Process -Id $process.ProcessId -Force
+    }
   }
 }
 

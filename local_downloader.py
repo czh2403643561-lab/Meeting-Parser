@@ -6,6 +6,7 @@ import json
 import os
 import re
 import socket
+import sys
 import threading
 import time
 import uuid
@@ -68,6 +69,7 @@ BAD_CONTENT_TYPES = (
 
 TASKS: dict[str, dict] = {}
 TASKS_LOCK = threading.RLock()
+CANCEL_EVENTS: dict[str, threading.Event] = {}
 ACTIVITY_LOCK = threading.Lock()
 LAST_ACTIVITY = time.monotonic()
 CLIENT_DISCONNECT_ERRNOS = {
@@ -81,6 +83,12 @@ CLIENT_DISCONNECT_ERRNOS = {
 
 class DownloadError(Exception):
     """An expected download failure that is safe to return to the extension."""
+
+
+def log_message(message: str) -> None:
+    stream = sys.stderr
+    if stream is not None:
+        print(message, file=stream, flush=True)
 
 
 def note_activity() -> None:
@@ -186,10 +194,10 @@ def log_progress(downloaded: int, total: int | None, last_bytes: int, last_progr
     if progress is not None:
         if progress < last_progress + LOG_PERCENT_STEP and progress < 100:
             return last_bytes, last_progress
-        print(f"[task] downloading: {format_bytes(downloaded)} / {format_bytes(total)} ({progress:.0f}%)", flush=True)
+        log_message(f"[task] downloading: {format_bytes(downloaded)} / {format_bytes(total)} ({progress:.0f}%)")
         return downloaded, progress
     if downloaded - last_bytes >= LOG_BYTES_STEP:
-        print(f"[task] downloading: {format_bytes(downloaded)}", flush=True)
+        log_message(f"[task] downloading: {format_bytes(downloaded)}")
         return downloaded, last_progress
     return last_bytes, last_progress
 
@@ -248,7 +256,7 @@ def run_download(task_id: str, url: str, headers: dict[str, str], filename: str)
     last_log_progress = 0
     try:
         note_activity()
-        print(f"[task] started: {filename}", flush=True)
+        log_message(f"[task] started: {filename}")
         target = unique_target(filename)
         part = target.with_name(target.name + ".part")
         request = Request(url, headers=headers, method="GET")
@@ -297,6 +305,8 @@ def run_download(task_id: str, url: str, headers: dict[str, str], filename: str)
                         break
                     output.write(chunk)
                     total += len(chunk)
+                    if CANCEL_EVENTS.get(task_id) and CANCEL_EVENTS[task_id].is_set():
+                        raise DownloadError("下载已取消。")
                     note_activity()
                     progress = progress_for(total, total_bytes)
                     update_task(task_id, bytes=total, totalBytes=total_bytes, progress=progress)
@@ -319,7 +329,7 @@ def run_download(task_id: str, url: str, headers: dict[str, str], filename: str)
             progress=100.0,
             error="",
         )
-        print(f"[task] completed: {target.name}", flush=True)
+        log_message(f"[task] completed: {target.name}")
     except Exception as error:  # The task must always remain observable by the side panel.
         if part is not None:
             try:
@@ -336,8 +346,9 @@ def run_download(task_id: str, url: str, headers: dict[str, str], filename: str)
             totalBytes=total_bytes,
             progress=progress_for(total, total_bytes),
         )
-        print(f"[task] failed: {message}", flush=True)
+        log_message(f"[task] failed: {message}")
     finally:
+        CANCEL_EVENTS.pop(task_id, None)
         note_activity()
 
 
@@ -359,9 +370,19 @@ def create_download(payload: dict) -> tuple[str, str]:
             "progress": None,
             "error": "",
         }
+        CANCEL_EVENTS[task_id] = threading.Event()
     worker = threading.Thread(target=run_download, args=(task_id, url, headers, filename), daemon=True)
     worker.start()
     return task_id, filename
+
+
+def cancel_download(task_id: str) -> bool:
+    with TASKS_LOCK:
+        event = CANCEL_EVENTS.get(task_id)
+        if event is None:
+            return False
+        event.set()
+        return True
 
 
 class DownloaderHandler(BaseHTTPRequestHandler):
@@ -441,12 +462,12 @@ class DownloaderHandler(BaseHTTPRequestHandler):
 def run_server() -> None:
     server = ThreadingHTTPServer((HOST, PORT), DownloaderHandler)
     server.timeout = 1
-    print(f"Local downloader listening on http://{HOST}:{PORT}")
+    log_message(f"Local downloader listening on http://{HOST}:{PORT}")
     try:
         while True:
             server.handle_request()
             if not has_active_tasks() and seconds_since_activity() >= IDLE_EXIT_SECONDS:
-                print("Local downloader stopped after idle timeout.")
+                log_message("Local downloader stopped after idle timeout.")
                 break
     except KeyboardInterrupt:
         pass

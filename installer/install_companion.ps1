@@ -12,7 +12,7 @@ if ([string]::IsNullOrWhiteSpace($SourceDirectory)) {
 }
 
 $source = Resolve-Path -LiteralPath $SourceDirectory -ErrorAction Stop
-$requiredFiles = @("MeetingParserDownloader.exe", "MeetingParserNativeHost.exe")
+$requiredFiles = @("MeetingParserHost.exe")
 foreach ($file in $requiredFiles) {
   if (-not (Test-Path -LiteralPath (Join-Path $source $file) -PathType Leaf)) {
     throw "安装包缺少：$file。请先运行 scripts\build_companion.ps1。"
@@ -21,18 +21,37 @@ foreach ($file in $requiredFiles) {
 
 $installDirectory = Join-Path $env:LOCALAPPDATA $MeetingParserInstallDirectoryName
 $nativeManifestPath = Join-Path $installDirectory "com.meetingparser.helper.json"
+$ownedExecutables = @(
+  (Join-Path $installDirectory "MeetingParserHost.exe"),
+  (Join-Path $installDirectory "MeetingParserNativeHost.exe"),
+  (Join-Path $installDirectory "MeetingParserDownloader.exe")
+)
 $nativeManifest = @{
   name = $MeetingParserNativeHostName
-  description = "Meeting Parser local downloader starter"
-  path = (Join-Path $installDirectory "MeetingParserNativeHost.exe")
+  description = "Meeting Parser direct download host"
+  path = (Join-Path $installDirectory "MeetingParserHost.exe")
   type = "stdio"
   allowed_origins = @("chrome-extension://$MeetingParserExtensionId/")
 } | ConvertTo-Json -Depth 3
 
 if ($PSCmdlet.ShouldProcess($installDirectory, "安装 Meeting Parser 本地组件")) {
   New-Item -ItemType Directory -Force -Path $installDirectory | Out-Null
+  foreach ($ownedExecutable in $ownedExecutables) {
+    try {
+      $runningProcesses = Get-CimInstance Win32_Process -Filter "Name='$([IO.Path]::GetFileName($ownedExecutable))'" |
+        Where-Object { $_.ExecutablePath -eq $ownedExecutable }
+    } catch {
+      $runningProcesses = @()
+    }
+    foreach ($process in $runningProcesses) {
+      Stop-Process -Id $process.ProcessId -Force
+    }
+  }
   foreach ($file in $requiredFiles) {
     Copy-Item -LiteralPath (Join-Path $source $file) -Destination (Join-Path $installDirectory $file) -Force
+  }
+  foreach ($oldFile in @("MeetingParserNativeHost.exe", "MeetingParserDownloader.exe")) {
+    Remove-Item -LiteralPath (Join-Path $installDirectory $oldFile) -Force -ErrorAction SilentlyContinue
   }
   Set-Content -LiteralPath $nativeManifestPath -Value $nativeManifest -Encoding utf8
 

@@ -23,8 +23,7 @@ const BATCH_LOG_KEY = "batchEventLog";
 const BATCH_SESSION_KEY = "batchBrowserSessionActive";
 const NATIVE_HOST_NAME = "com.meetingparser.helper";
 const RELEASE_SETUP_URL = "https://github.com/czh2403643561-lab/Meeting-Parser/releases/latest/download/MeetingParserSetup.exe";
-const MIN_COMPANION_VERSION = "0.5.0";
-const LOCAL_DOWNLOADER_BASE = "http://127.0.0.1:8765";
+const MIN_COMPANION_VERSION = "0.6.0";
 const MAX_BATCH_LOGS = 300;
 const BATCH_ALARM_NAME = "batchDownloadTick";
 const PAGE_LOAD_TIMEOUT_MS = 30 * 1000;
@@ -38,6 +37,14 @@ let batchLogQueue = Promise.resolve();
 let localDownloaderStarting = null;
 let localDownloaderState = "checking";
 let keepAwakeRequested = false;
+let nativePort = null;
+let nativeHelloPromise = null;
+let nativeHelloWaiter = null;
+const nativeDownloadStates = new Map();
+const nativePendingStarts = new Map();
+let companionInstallationMode = false;
+let companionInstallProbeArmed = false;
+let lastCompanionProbeAt = 0;
 
 if (chrome.sidePanel?.setPanelBehavior) {
   void chrome.sidePanel.setPanelBehavior({ openPanelOnActionClick: true });
@@ -549,44 +556,10 @@ function filenameForDownload(url, recordingTitle, pageTitle) {
   return `${safeFilenamePart(title || filePart || "media") || "media"}.mp4`;
 }
 
-async function localDownloaderRequest(path, options = {}) {
-  let response;
-  try {
-    response = await fetch(`${LOCAL_DOWNLOADER_BASE}${path}`, {
-      cache: "no-store",
-      ...options
-    });
-  } catch {
-    throw new Error("本地下载服务暂时不可用。");
-  }
-
-  let body = {};
-  try {
-    body = await response.json();
-  } catch {
-    body = {};
-  }
-  if (!response.ok) {
-    throw new Error(body.error || `本地下载器返回 HTTP ${response.status}。`);
-  }
-  return body;
-}
-
 function setLocalDownloaderState(state) {
   if (localDownloaderState === state) return;
   localDownloaderState = state;
   void chrome.runtime.sendMessage({ type: "localDownloaderStateChanged", state }).catch(() => undefined);
-}
-
-async function checkLocalDownloaderHealth() {
-  try {
-    const result = await localDownloaderRequest("/health");
-    const version = typeof result.version === "string" ? result.version : "";
-    const compatible = result.ok === true && versionAtLeast(version, MIN_COMPANION_VERSION);
-    return { ok: compatible, version, needsUpdate: result.ok === true && !compatible };
-  } catch (error) {
-    return { ok: false, error: error.message };
-  }
 }
 
 function versionAtLeast(actual, required) {
@@ -602,66 +575,160 @@ function versionAtLeast(actual, required) {
   return true;
 }
 
-function sendNativeMessage(message) {
-  return new Promise((resolve, reject) => {
-    chrome.runtime.sendNativeMessage(NATIVE_HOST_NAME, message, (response) => {
-      const error = chrome.runtime.lastError;
-      if (error) reject(new Error(error.message));
-      else resolve(response || {});
-    });
-  });
-}
-
 function nativeHostMissing(error) {
   return /native messaging host|host.*not found|未找到|找不到/i.test(error?.message || "");
 }
 
+function nativeTaskId(value) {
+  return typeof value === "string" && /^[A-Za-z0-9-]{1,128}$/.test(value);
+}
+
+function nativeDisconnectError(message = "") {
+  return new Error(message || "本地下载组件连接已中断，当前任务未自动重试。");
+}
+
+function handleNativeMessage(message) {
+  if (message?.type === "hello") {
+    nativeHelloWaiter?.resolve(message);
+    nativeHelloWaiter = null;
+    return;
+  }
+  if (nativeHelloWaiter) {
+    nativeHelloWaiter.reject(new Error("检测到旧版本地组件。"));
+    nativeHelloWaiter = null;
+    return;
+  }
+  if (message?.type !== "downloadStatus" || !nativeTaskId(message.requestId)) return;
+  const state = {
+    taskId: message.requestId,
+    status: message.status || "failed",
+    filename: message.filename || "",
+    bytes: Number(message.bytes) || 0,
+    totalBytes: Number.isFinite(message.totalBytes) ? Number(message.totalBytes) : null,
+    progress: Number.isFinite(message.progress) ? Number(message.progress) : null,
+    error: typeof message.error === "string" ? message.error : ""
+  };
+  nativeDownloadStates.set(state.taskId, state);
+  void updateActiveDownloadStatus(state.taskId, state);
+  void chrome.runtime.sendMessage({ type: "localDownloadStatusChanged", status: state }).catch(() => undefined);
+  const pending = nativePendingStarts.get(state.taskId);
+  if (pending) {
+    nativePendingStarts.delete(state.taskId);
+    clearTimeout(pending.timer);
+    pending.resolve(state);
+  }
+  if (["complete", "failed"].includes(state.status)) void chrome.runtime.sendMessage({ type: "localDownloaderStateChanged", state: "ready" }).catch(() => undefined);
+}
+
+function handleNativeDisconnect(disconnectMessage = "") {
+  nativePort = null;
+  nativeHelloPromise = null;
+  nativeHelloWaiter?.reject(nativeDisconnectError(disconnectMessage));
+  nativeHelloWaiter = null;
+  for (const [taskId, pending] of nativePendingStarts) {
+    clearTimeout(pending.timer);
+    pending.reject(nativeDisconnectError(disconnectMessage));
+    nativePendingStarts.delete(taskId);
+  }
+  for (const [taskId, state] of nativeDownloadStates) {
+    if (["complete", "failed"].includes(state.status)) continue;
+    const failed = { ...state, status: "failed", error: "本地下载组件连接中断，当前任务未自动重试。" };
+    nativeDownloadStates.set(taskId, failed);
+    void updateActiveDownloadStatus(taskId, failed);
+  }
+  if (!companionInstallationMode) setLocalDownloaderState("unavailable");
+}
+
+function connectNativePort() {
+  if (nativePort) return nativePort;
+  const port = chrome.runtime.connectNative(NATIVE_HOST_NAME);
+  nativePort = port;
+  port.onMessage.addListener(handleNativeMessage);
+  port.onDisconnect.addListener(() => handleNativeDisconnect(chrome.runtime.lastError?.message || ""));
+  return port;
+}
+
+function requestNativeHello(port) {
+  if (nativeHelloPromise) return nativeHelloPromise;
+  nativeHelloPromise = new Promise((resolve, reject) => {
+    const timer = setTimeout(() => {
+      nativeHelloWaiter = null;
+      reject(new Error("本地下载组件没有响应。"));
+    }, 3000);
+    nativeHelloWaiter = {
+      resolve: (message) => {
+        clearTimeout(timer);
+        resolve(message);
+      },
+      reject: (error) => {
+        clearTimeout(timer);
+        reject(error);
+      }
+    };
+    try {
+      port.postMessage({ type: "hello" });
+    } catch (error) {
+      clearTimeout(timer);
+      nativeHelloWaiter = null;
+      reject(error);
+    }
+  }).finally(() => {
+    nativeHelloPromise = null;
+  });
+  return nativeHelloPromise;
+}
+
+function disconnectNativePort() {
+  const port = nativePort;
+  nativePort = null;
+  nativeHelloPromise = null;
+  nativeHelloWaiter = null;
+  if (port) {
+    try {
+      port.disconnect();
+    } catch {
+      // The port may already be disconnected.
+    }
+  }
+}
+
 async function ensureLocalDownloader() {
-  const health = await checkLocalDownloaderHealth();
-  if (health.ok) {
-    setLocalDownloaderState("ready");
-    return { ok: true, state: "ready" };
+  if (companionInstallationMode && !companionInstallProbeArmed) {
+    setLocalDownloaderState("waiting-install");
+    return { ok: false, state: "waiting-install" };
   }
-  if (health.needsUpdate) {
-    setLocalDownloaderState("update-required");
-    throw new Error("本地组件需要更新，请下载安装程序。");
+  if (companionInstallProbeArmed && Date.now() - lastCompanionProbeAt < 8000) {
+    return { ok: false, state: "waiting-install" };
   }
+  if (nativePort && localDownloaderState === "ready") return { ok: true, state: "ready" };
   if (localDownloaderStarting) return localDownloaderStarting;
 
   localDownloaderStarting = (async () => {
     setLocalDownloaderState("starting");
-    let helper;
+    lastCompanionProbeAt = Date.now();
+    let response;
     try {
-      helper = await sendNativeMessage({ action: "ensureDownloader" });
+      const port = connectNativePort();
+      response = await requestNativeHello(port);
     } catch (error) {
-      setLocalDownloaderState(nativeHostMissing(error) ? "not-installed" : "unavailable");
+      disconnectNativePort();
+      const missing = nativeHostMissing(error);
+      const oldVersion = /旧版本/.test(error?.message || "");
+      setLocalDownloaderState(missing ? "not-installed" : oldVersion ? "update-required" : "unavailable");
       throw new Error(
-        nativeHostMissing(error)
-          ? "本地组件尚未安装，请先完成一次安装。"
-          : "本地组件暂时不可用，请稍后重试。"
+        missing ? "本地组件尚未安装，请先完成一次安装。" : oldVersion ? "本地组件需要更新，请下载安装程序。" : "本地组件启动失败，请稍后重试。"
       );
     }
-
-    if (!helper?.ok) {
-      const missing = ["downloader_missing", "unsupported_action"].includes(helper?.code);
-      setLocalDownloaderState(missing ? "not-installed" : "unavailable");
-      throw new Error(missing ? "本地组件尚未安装，请先完成一次安装。" : "本地组件启动失败，请稍后重试。");
+    const version = typeof response?.version === "string" ? response.version : "";
+    if (response?.type !== "hello" || !versionAtLeast(version, MIN_COMPANION_VERSION)) {
+      disconnectNativePort();
+      setLocalDownloaderState("update-required");
+      throw new Error("本地组件需要更新，请下载安装程序。");
     }
-
-    for (let attempt = 0; attempt < 12; attempt += 1) {
-      const retry = await checkLocalDownloaderHealth();
-      if (retry.ok) {
-        setLocalDownloaderState("ready");
-        return { ok: true, state: "ready" };
-      }
-      if (retry.needsUpdate) {
-        setLocalDownloaderState("update-required");
-        throw new Error("本地组件需要更新，请下载安装程序。");
-      }
-      await waitFor(250);
-    }
-    setLocalDownloaderState("unavailable");
-    throw new Error("本地组件启动失败，请稍后重试。");
+    companionInstallationMode = false;
+    companionInstallProbeArmed = false;
+    setLocalDownloaderState("ready");
+    return { ok: true, state: "ready", version };
   })();
 
   try {
@@ -677,6 +744,34 @@ async function checkLocalDownloader() {
   } catch (error) {
     return { ok: false, error: error.message, state: localDownloaderState };
   }
+}
+
+async function startNativeDownload(payload) {
+  const health = await ensureLocalDownloader();
+  if (!health.ok || !nativePort) throw new Error("本地下载组件暂时不可用。");
+  const requestId = globalThis.crypto?.randomUUID
+    ? crypto.randomUUID()
+    : `download-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+  const firstStatus = new Promise((resolve, reject) => {
+    const timer = setTimeout(() => {
+      nativePendingStarts.delete(requestId);
+      reject(new Error("本地下载组件响应超时。"));
+    }, 10000);
+    nativePendingStarts.set(requestId, { resolve, reject, timer });
+  });
+  try {
+    nativePort.postMessage({ type: "startDownload", requestId, ...payload });
+  } catch (error) {
+    const pending = nativePendingStarts.get(requestId);
+    if (pending) {
+      clearTimeout(pending.timer);
+      nativePendingStarts.delete(requestId);
+      pending.reject(error);
+    }
+  }
+  const status = await firstStatus;
+  if (status.status === "failed") throw new Error(status.error || "本地下载失败。");
+  return status;
 }
 
 function notifyDownloadStage(tabId, candidateId, stage) {
@@ -776,14 +871,10 @@ async function prepareCandidateAndStartDownload(message, options = {}) {
   notifyDownloadStage(message.tabId, message.candidateId, "connecting");
   await ensureLocalDownloader();
   notifyDownloadStage(message.tabId, message.candidateId, "submitting");
-  const result = await localDownloaderRequest("/download", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
-      url,
-      filename: message.filename || filenameForDownload(url, message.recordingTitle, message.pageTitle),
-      headers: localDownloadHeaders(context)
-    })
+  const result = await startNativeDownload({
+    url,
+    filename: message.filename || filenameForDownload(url, message.recordingTitle, message.pageTitle),
+    headers: localDownloadHeaders(context)
   });
   if (options.trackActiveDownload) {
     await saveActiveDownload({
@@ -798,10 +889,12 @@ async function prepareCandidateAndStartDownload(message, options = {}) {
 }
 
 async function getLocalDownloadStatus(taskId) {
-  if (typeof taskId !== "string" || !/^[a-f0-9]{32}$/.test(taskId)) {
+  if (!nativeTaskId(taskId)) {
     throw new Error("本地下载任务编号无效。");
   }
-  return localDownloaderRequest(`/status?id=${encodeURIComponent(taskId)}`);
+  const status = nativeDownloadStates.get(taskId);
+  if (!status) throw new Error("本地下载任务状态暂不可用。");
+  return status;
 }
 
 async function saveActiveDownload(activeDownload) {
@@ -827,13 +920,34 @@ async function getActiveDownload() {
   } catch {
     return {
       ...active,
-      serviceError: "本地下载服务已停止，无法获取当前任务状态。"
+      serviceError: "本地下载组件连接已中断，当前任务未自动重试。"
     };
   }
 }
 
 async function clearActiveDownload() {
   await chrome.storage.session.remove(ACTIVE_DOWNLOAD_KEY);
+  return { ok: true };
+}
+
+async function beginCompanionUpdate() {
+  const activeResult = await chrome.storage.session.get(ACTIVE_DOWNLOAD_KEY);
+  const active = activeResult[ACTIVE_DOWNLOAD_KEY];
+  const batch = await getBatchState();
+  const batchTaskState = batchTask(batch)?.status;
+  if (["queued", "connecting", "downloading"].includes(active?.status) || batch.status === "running" || batchTaskState === "downloading") {
+    throw new Error("当前有下载任务正在进行，请等待完成后再更新本地组件。");
+  }
+  companionInstallationMode = true;
+  companionInstallProbeArmed = false;
+  disconnectNativePort();
+  setLocalDownloaderState("waiting-install");
+  return { ok: true, state: "waiting-install" };
+}
+
+function armCompanionInstallProbe() {
+  companionInstallProbeArmed = true;
+  lastCompanionProbeAt = 0;
   return { ok: true };
 }
 
@@ -865,7 +979,7 @@ function persistedBatchTask(task, index) {
     pageTitle: typeof task?.pageTitle === "string" ? task.pageTitle.slice(0, 240) : "",
     recordingTitle: typeof task?.recordingTitle === "string" ? task.recordingTitle.slice(0, MAX_RECORDING_TITLE_LENGTH) : "",
     filename: typeof task?.filename === "string" ? task.filename.slice(0, 240) : "",
-    taskId: typeof task?.taskId === "string" && /^[a-f0-9]{32}$/.test(task.taskId) ? task.taskId : "",
+    taskId: nativeTaskId(task?.taskId) ? task.taskId : "",
     bytes: Number.isFinite(task?.bytes) ? Math.max(0, Number(task.bytes)) : 0,
     totalBytes: Number.isFinite(task?.totalBytes) ? Math.max(0, Number(task.totalBytes)) : null,
     progress: Number.isFinite(task?.progress) ? Math.max(0, Math.min(100, Number(task.progress))) : null,
@@ -1234,7 +1348,7 @@ async function advanceBatchQueue() {
       task.progress = null;
       state.statusMessage = "下载中…";
       await saveBatchState(state);
-      await appendBatchLog("local_download_submitted", state, "已提交本地下载器");
+      await appendBatchLog("local_download_submitted", state, "已提交本地下载组件");
       queueBatchAdvance();
     } catch (error) {
       await failBatchTask(state, task, error.message === "自动准备失败，请播放视频后重试。" ? "媒体上下文准备失败。" : error.message);
@@ -1285,7 +1399,7 @@ async function startBatch(message) {
     await appendBatchLog("batch_health_failed", previous, health.error || "本地组件不可用");
     throw new Error(health.error || "本地组件暂时不可用，请稍后重试。");
   }
-  await appendBatchLog("batch_health_ok", previous, "本地下载服务已就绪");
+  await appendBatchLog("batch_health_ok", previous, "本地下载组件已就绪");
   const state = {
     ...emptyBatchState(),
     status: "starting",
@@ -1449,6 +1563,18 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       url: RELEASE_SETUP_URL,
       filename: "MeetingParserSetup.exe"
     });
+    return;
+  }
+
+  if (message?.type === "beginCompanionUpdate") {
+    beginCompanionUpdate()
+      .then((result) => sendResponse(result))
+      .catch((error) => sendResponse({ error: error.message }));
+    return true;
+  }
+
+  if (message?.type === "armCompanionInstallProbe") {
+    sendResponse(armCompanionInstallProbe());
     return;
   }
 

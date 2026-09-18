@@ -87,9 +87,9 @@ function showBatchFeedback(message) {
 
 function renderLocalServiceStatus(state) {
   const messages = {
-    ready: "本地下载服务已就绪",
+    ready: "本地下载组件已就绪",
     checking: "正在检查本地组件…",
-    starting: "正在启动下载服务…",
+    starting: "正在启动本地下载组件…",
     "not-installed": "需要安装本地组件",
     "update-required": "本地组件需要更新",
     "waiting-install": "正在等待安装完成…",
@@ -197,7 +197,7 @@ async function pollForCompanionInstallation() {
   installLocalComponentButton.textContent = "安装程序已下载";
   recheckLocalComponentButton.hidden = true;
   onboardingFeedback.textContent = "安装程序已下载，请运行 MeetingParserSetup.exe。";
-  setupPollTimer = setTimeout(() => void pollForCompanionInstallation(), 2500);
+  setupPollTimer = setTimeout(() => void pollForCompanionInstallation(), 10000);
 }
 
 async function beginCompanionInstallation({ redownload = false } = {}) {
@@ -209,9 +209,12 @@ async function beginCompanionInstallation({ redownload = false } = {}) {
   recheckLocalComponentButton.hidden = true;
   onboardingFeedback.textContent = "正在准备安装程序…";
   try {
+    const update = await chrome.runtime.sendMessage({ type: "beginCompanionUpdate" });
+    if (update?.error) throw new Error(update.error);
     const info = await chrome.runtime.sendMessage({ type: "getCompanionSetup" });
     if (info?.error || !info?.ok) throw new Error(info?.error || "暂未配置安装程序下载地址。");
     await downloadSetupFile(info);
+    await chrome.runtime.sendMessage({ type: "armCompanionInstallProbe" });
     setupPollDeadline = Date.now() + 5 * 60 * 1000;
     onboardingFeedback.textContent = "安装程序已下载，请运行 MeetingParserSetup.exe。";
     await pollForCompanionInstallation();
@@ -228,6 +231,7 @@ async function recheckCompanionInstallation() {
   stopSetupPolling();
   setupDownloadInProgress = true;
   setupPollDeadline = Date.now() + 5 * 60 * 1000;
+  await chrome.runtime.sendMessage({ type: "armCompanionInstallProbe" });
   recheckLocalComponentButton.hidden = true;
   onboardingFeedback.textContent = "正在等待安装完成…";
   await pollForCompanionInstallation();
@@ -517,10 +521,10 @@ function downloadLabel(status) {
   if (status.message) return status.message;
   if (status.serviceError) return status.serviceError;
   if (status.status === "complete") return `下载完成：${status.filename || "MP4 文件"}`;
-  if (status.status === "failed") return `下载失败：${status.error || "本地下载器报告失败。"}`;
+  if (status.status === "failed") return `下载失败：${status.error || "本地下载组件报告失败。"}`;
   if (status.status === "preparing") return "正在准备下载上下文…";
   if (status.status === "queued") return "下载已开始";
-  if (status.status === "connecting") return "正在连接本地下载器…";
+  if (status.status === "connecting") return "正在连接本地下载组件…";
   if (status.status === "submitting") return "正在提交任务…";
   return `下载中：${status.filename || "MP4 文件"}`;
 }
@@ -574,44 +578,11 @@ function stopMonitoring() {
   }
 }
 
-function monitorLocalDownload(taskId) {
-  stopMonitoring();
-  const token = monitorToken;
-
-  const poll = async () => {
-    if (token !== monitorToken) return;
-    let result;
-    try {
-      result = await chrome.runtime.sendMessage({ type: "getLocalDownloadStatus", taskId });
-    } catch {
-      result = { error: "service-unavailable" };
-    }
-    if (token !== monitorToken) return;
-
-    if (result?.error) {
-      renderDownload({
-        ...(activeDownload || { taskId, filename: "MP4 文件", status: "downloading", bytes: 0 }),
-        serviceError: "本地下载服务已停止，无法获取当前任务状态。"
-      });
-      monitorTimer = setTimeout(poll, 1000);
-      return;
-    }
-
-    activeDownload = { ...(activeDownload || {}), ...result };
-    renderDownload(activeDownload);
-    if (isTerminal(result)) return;
-    monitorTimer = setTimeout(poll, 700);
-  };
-
-  void poll();
-}
-
 async function restoreActiveDownload() {
   const result = await chrome.runtime.sendMessage({ type: "getActiveDownload" });
   if (!result) return;
   activeDownload = result;
   renderDownload(result);
-  if (!isTerminal(result)) monitorLocalDownload(result.taskId);
 }
 
 function createCandidateCard(candidate, page, tabId) {
@@ -678,13 +649,12 @@ function createCandidateCard(candidate, page, tabId) {
         };
         pendingFilename = result.filename || pendingFilename;
         renderDownload(activeDownload);
-        monitorLocalDownload(result.taskId);
       } catch (error) {
         renderDownload({
           status: "failed",
           filename: pendingFilename,
           bytes: 0,
-          error: error.message || "本地下载器通信失败。"
+          error: error.message || "本地下载组件通信失败。"
         });
       } finally {
         download.disabled = false;
@@ -977,6 +947,12 @@ chrome.runtime.onMessage.addListener((message) => {
   }
   if (message?.type === "batchLogChanged" && !batchLogOutput.hidden) void refreshBatchLogs();
   if (message?.type === "localDownloaderStateChanged") renderLocalServiceStatus(message.state);
+  if (message?.type === "localDownloadStatusChanged" && message.status?.taskId) {
+    if (!activeDownload || activeDownload.taskId === message.status.taskId) {
+      activeDownload = { ...(activeDownload || {}), ...message.status };
+      renderDownload(activeDownload);
+    }
+  }
 });
 
 refreshButton.addEventListener("click", refresh);
