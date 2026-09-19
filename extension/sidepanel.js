@@ -30,12 +30,17 @@ const batchLinks = document.querySelector("#batch-links");
 const parseBatchButton = document.querySelector("#parse-batch");
 const batchSummary = document.querySelector("#batch-summary");
 const batchList = document.querySelector("#batch-list");
+const batchTaskType = document.querySelector("#batch-task-type");
 const mediaPreference = document.querySelector("#media-preference");
+const mediaPreferenceControl = document.querySelector("#media-preference-control");
+const transcriptExportControl = document.querySelector("#transcript-export-control");
+const transcriptExportMode = document.querySelector("#transcript-export-mode");
 const batchProgress = document.querySelector("#batch-progress");
 const batchCurrent = document.querySelector("#batch-current");
 const batchStatus = document.querySelector("#batch-status");
 const batchFileProgress = document.querySelector("#batch-file-progress");
 const batchSize = document.querySelector("#batch-size");
+const batchOutputPath = document.querySelector("#batch-output-path");
 const startBatchButton = document.querySelector("#start-batch");
 const pauseBatchButton = document.querySelector("#pause-batch");
 const resumeBatchButton = document.querySelector("#resume-batch");
@@ -401,14 +406,34 @@ const batchStatusLabels = {
   pending: "待处理",
   navigating: "正在打开页面",
   detecting: "正在发现 MP4",
+  extracting: "正在采集逐字稿",
   preparing: "正在准备下载上下文",
   downloading: "下载中",
   complete: "已完成",
   failed: "失败"
 };
 
+function batchTaskStatusLabel(item) {
+  if (batchState?.taskType === "transcript") {
+    if (item.status === "navigating" || item.status === "detecting") return "加载中";
+    if (item.status === "extracting") return "采集中";
+    if (item.status === "complete") return "完成";
+    if (item.status === "failed") return "失败";
+    if (item.status === "pending") return "等待";
+  }
+  return batchStatusLabels[item.status] || item.status || "待处理";
+}
+
+function updateBatchModeControls() {
+  const transcript = batchTaskType.value === "transcript";
+  mediaPreferenceControl.hidden = transcript;
+  transcriptExportControl.hidden = !transcript;
+  if (!startBatchButton.dataset.busy) startBatchButton.textContent = transcript ? "开始批量提取" : "开始批量下载";
+}
+
 function renderBatchDraft(draft) {
   batchDraft = draft || batchDraft;
+  batchOutputPath.textContent = "";
   const count = batchDraft.items?.length || 0;
   renderBatchOverview({ total: count, complete: 0, failed: 0, pending: count });
   batchListCount.textContent = count ? `${count} 条任务` : "暂无任务";
@@ -416,6 +441,7 @@ function renderBatchDraft(draft) {
     ? `已解析 ${count} 条，等待开始 · 重复 ${batchDraft.duplicateCount || 0} 条 · 无效 ${batchDraft.invalidCount || 0} 条`
     : "尚未解析";
   if (!batchState?.tasks?.length) renderBatchItems(batchDraft.items || []);
+  updateBatchModeControls();
 }
 
 function renderBatchItems(items) {
@@ -427,8 +453,9 @@ function renderBatchItems(items) {
     row.title = item.pageUrl || item.url || title;
     const state = document.createElement("small");
     const progress = item.status === "downloading" && Number.isFinite(item.progress) ? ` · ${item.progress.toFixed(1)}%` : "";
+    const textLength = Number(item.textLength) > 0 ? ` · ${item.textLength} 字` : "";
     const error = item.status === "failed" && item.error ? `：${item.error}` : "";
-    state.textContent = `${batchStatusLabels[item.status] || item.status || "待处理"}${progress}${error}`;
+    state.textContent = `${batchTaskStatusLabel(item)}${progress}${textLength}${error}`;
     row.append(state);
     if (item.status === "failed") {
       const retry = document.createElement("button");
@@ -477,7 +504,7 @@ function renderBatchState(state) {
     return;
   }
   const counts = batchCounts({ tasks });
-  const waiting = (counts.pending || 0) + (counts.navigating || 0) + (counts.detecting || 0) + (counts.preparing || 0) + (counts.downloading || 0);
+  const waiting = (counts.pending || 0) + (counts.navigating || 0) + (counts.detecting || 0) + (counts.extracting || 0) + (counts.preparing || 0) + (counts.downloading || 0);
   const current = tasks[state?.currentIndex] || null;
   renderBatchOverview({ ...counts, pending: waiting });
   batchListCount.textContent = counts.total ? `${counts.total} 条任务` : "暂无任务";
@@ -495,7 +522,7 @@ function renderBatchState(state) {
   batchProgress.hidden = !current;
   if (current) {
     batchCurrent.textContent = `当前第 ${current.index + 1} / ${counts.total}`;
-    batchStatus.textContent = state.statusMessage || `${batchStatusLabels[current.status] || current.status}${current.filename ? `：${current.filename}` : current.recordingTitle || current.pageTitle ? `：${current.recordingTitle || current.pageTitle}` : ""}`;
+    batchStatus.textContent = state.statusMessage || `${batchTaskStatusLabel(current)}${current.filename ? `：${current.filename}` : current.recordingTitle || current.pageTitle ? `：${current.recordingTitle || current.pageTitle}` : ""}`;
     const totalBytes = Number.isFinite(current.totalBytes) ? current.totalBytes : null;
     if (totalBytes !== null && current.status === "downloading") {
       const progress = Number.isFinite(current.progress) ? current.progress : 0;
@@ -504,15 +531,28 @@ function renderBatchState(state) {
       batchSize.textContent = `${formatBytes(Number(current.bytes) || 0)} / ${formatBytes(totalBytes)} · ${progress.toFixed(1)}%`;
     } else {
       batchFileProgress.hidden = true;
-      batchSize.textContent = current.status === "downloading" ? `已下载 ${formatBytes(Number(current.bytes) || 0)}` : "";
+      batchSize.textContent = state.taskType === "transcript"
+        ? `段落：${current.paragraphCount || 0} · 字数：${current.textLength || 0}`
+        : current.status === "downloading" ? `已下载 ${formatBytes(Number(current.bytes) || 0)}` : "";
+    }
+    if (state.taskType === "transcript" && current.status === "complete") {
+      batchSize.textContent = `段落：${current.paragraphCount || 0} · 字数：${current.textLength || 0}`;
     }
   }
 
+  batchTaskType.value = ["video", "transcript"].includes(state?.taskType) ? state.taskType : "video";
   mediaPreference.value = ["auto", "screen", "speaker"].includes(state?.mediaPreference) ? state.mediaPreference : "auto";
+  transcriptExportMode.value = ["unified", "hierarchical"].includes(state?.transcriptExportMode) ? state.transcriptExportMode : "hierarchical";
+  batchOutputPath.textContent = state?.transcriptOutputDirectory
+    ? `输出目录：下载目录/${state.transcriptOutputDirectory}/`
+    : state?.transcriptOutputFile ? `输出文件：下载目录/${state.transcriptOutputFile}` : "";
+  updateBatchModeControls();
   startBatchButton.hidden = ["starting", "running"].includes(state?.status);
   pauseBatchButton.hidden = state?.status !== "running";
   resumeBatchButton.hidden = state?.status !== "paused";
-  startBatchButton.textContent = state?.status === "completed" ? "重新开始批量下载" : "开始批量下载";
+  startBatchButton.textContent = state?.status === "completed"
+    ? (state.taskType === "transcript" ? "重新开始批量提取" : "重新开始批量下载")
+    : (state.taskType === "transcript" ? "开始批量提取" : "开始批量下载");
   if (state?.status === "paused" && !current?.taskId) {
     batchStatus.textContent = "批量已暂停。";
   }
@@ -891,6 +931,7 @@ clearDownloadButton.addEventListener("click", async () => {
 
 singleTab.addEventListener("click", () => setMode("single"));
 batchTab.addEventListener("click", () => setMode("batch"));
+batchTaskType.addEventListener("change", updateBatchModeControls);
 
 async function parseAndSaveBatchDraft() {
   const result = parseBatchLinks(batchLinks.value);
@@ -947,7 +988,7 @@ parseBatchButton.addEventListener("click", async () => {
 });
 
 startBatchButton.addEventListener("click", async () => {
-  if (localComponentState !== "ready") {
+  if (batchTaskType.value === "video" && localComponentState !== "ready") {
     showBatchFeedback("请先安装或更新本地组件。");
     companionOnboarding.hidden = false;
     return;
@@ -957,11 +998,13 @@ startBatchButton.addEventListener("click", async () => {
   batchProgress.hidden = false;
   batchStatus.textContent = "正在启动批量任务…";
   showBatchFeedback("正在启动批量任务…");
-  renderLocalServiceStatus("starting");
+  if (batchTaskType.value === "video") renderLocalServiceStatus("starting");
   try {
     const state = await chrome.runtime.sendMessage({
       type: "startBatch",
+      taskType: batchTaskType.value,
       mediaPreference: mediaPreference.value,
+      transcriptExportMode: transcriptExportMode.value,
       items: batchDraft.items
     });
     if (state?.error) throw new Error(state.error);
@@ -972,7 +1015,7 @@ startBatchButton.addEventListener("click", async () => {
     batchSummary.textContent = error.message || "批量启动失败。";
     showBatchFeedback("批量启动失败，请查看运行日志。");
     await refreshBatchLogs();
-    await refreshLocalServiceStatus();
+    if (batchTaskType.value === "video") await refreshLocalServiceStatus();
   } finally {
     delete startBatchButton.dataset.busy;
     updateDownloadControls();

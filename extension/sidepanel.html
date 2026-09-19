@@ -100,8 +100,8 @@
         <div class="view-heading">
           <div>
             <p class="eyebrow">连续任务</p>
-            <h1>批量下载</h1>
-            <p class="subtle-text">严格按顺序下载；工作标签页关闭后可继续任务。</p>
+            <h1>批量任务</h1>
+            <p class="subtle-text">严格按顺序执行；工作标签页关闭后可继续任务。</p>
           </div>
         </div>
 
@@ -120,6 +120,13 @@
           <div class="batch-control-row">
             <button id="parse-batch" type="button">解析链接</button>
             <label class="preference-label">
+              <span>任务类型</span>
+              <select id="batch-task-type">
+                <option value="video">视频下载</option>
+                <option value="transcript">逐字稿提取</option>
+              </select>
+            </label>
+            <label id="media-preference-control" class="preference-label">
               <span>优先下载</span>
               <select id="media-preference">
                 <option value="auto">自动 · 普通录制优先</option>
@@ -155,6 +162,7 @@
           <p id="batch-status" class="download-status" role="status"></p>
           <progress id="batch-file-progress" max="100" value="0" hidden></progress>
           <p id="batch-size" class="subtle-text"></p>
+          <p id="batch-output-path" class="subtle-text"></p>
         </section>
 
         <section class="panel task-list-panel">
@@ -167,7 +175,14 @@
           </div>
           <ol id="batch-list" class="batch-list"></ol>
           <div class="batch-actions">
-            <button id="start-batch" type="button">开始批量下载</button>
+            <label id="transcript-export-control" class="preference-label" hidden>
+              <span>逐字稿导出</span>
+              <select id="transcript-export-mode">
+                <option value="hierarchical">分级导出（默认）</option>
+                <option value="unified">统一导出</option>
+              </select>
+            </label>
+            <button id="start-batch" type="button">开始批量任务</button>
             <button id="pause-batch" class="secondary-button" type="button" hidden>暂停</button>
             <button id="resume-batch" type="button" hidden>继续</button>
           </div>

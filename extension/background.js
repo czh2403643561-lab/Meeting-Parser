@@ -28,6 +28,7 @@ const MAX_BATCH_LOGS = 300;
 const BATCH_ALARM_NAME = "batchDownloadTick";
 const PAGE_LOAD_TIMEOUT_MS = 30 * 1000;
 const MEDIA_DETECT_TIMEOUT_MS = 20 * 1000;
+const TRANSCRIPT_EXTRACT_TIMEOUT_MS = 3 * 60 * 1000;
 const candidateIdsByUrl = new Map();
 const candidateUrlsById = new Map();
 const tabPageStates = new Map();
@@ -987,7 +988,11 @@ function emptyBatchState() {
     workerTabId: null,
     currentIndex: 0,
     startedAt: "",
+    taskType: "video",
     mediaPreference: "auto",
+    transcriptExportMode: "hierarchical",
+    transcriptOutputDirectory: "",
+    transcriptOutputFile: "",
     statusMessage: "",
     error: "",
     tasks: []
@@ -1009,6 +1014,10 @@ function persistedBatchTask(task, index) {
     pageTitle: typeof task?.pageTitle === "string" ? task.pageTitle.slice(0, 240) : "",
     recordingTitle: typeof task?.recordingTitle === "string" ? task.recordingTitle.slice(0, MAX_RECORDING_TITLE_LENGTH) : "",
     filename: typeof task?.filename === "string" ? task.filename.slice(0, 240) : "",
+    transcriptText: typeof task?.transcriptText === "string" ? task.transcriptText.slice(0, 2000000) : "",
+    paragraphCount: Number.isFinite(task?.paragraphCount) ? Math.max(0, Number(task.paragraphCount)) : 0,
+    textLength: Number.isFinite(task?.textLength) ? Math.max(0, Number(task.textLength)) : 0,
+    transcriptProgressBucket: Number.isFinite(task?.transcriptProgressBucket) ? Number(task.transcriptProgressBucket) : -1,
     taskId: nativeTaskId(task?.taskId) ? task.taskId : "",
     bytes: Number.isFinite(task?.bytes) ? Math.max(0, Number(task.bytes)) : 0,
     totalBytes: Number.isFinite(task?.totalBytes) ? Math.max(0, Number(task.totalBytes)) : null,
@@ -1027,7 +1036,11 @@ function persistedBatchState(state) {
     workerTabId: Number.isInteger(state?.workerTabId) ? state.workerTabId : null,
     currentIndex: Number.isInteger(state?.currentIndex) ? Math.max(0, state.currentIndex) : 0,
     startedAt: typeof state?.startedAt === "string" ? state.startedAt : "",
+    taskType: ["video", "transcript"].includes(state?.taskType) ? state.taskType : "video",
     mediaPreference: ["auto", "screen", "speaker"].includes(state?.mediaPreference) ? state.mediaPreference : "auto",
+    transcriptExportMode: ["unified", "hierarchical"].includes(state?.transcriptExportMode) ? state.transcriptExportMode : "hierarchical",
+    transcriptOutputDirectory: typeof state?.transcriptOutputDirectory === "string" ? state.transcriptOutputDirectory.slice(0, 240) : "",
+    transcriptOutputFile: typeof state?.transcriptOutputFile === "string" ? state.transcriptOutputFile.slice(0, 240) : "",
     statusMessage: safeBatchLogText(state?.statusMessage || ""),
     error: safeBatchLogText(state?.error || ""),
     tasks: Array.isArray(state?.tasks) ? state.tasks.map(persistedBatchTask) : []
@@ -1149,6 +1162,83 @@ function batchFilename(task, candidate) {
   return `${String(task.index + 1).padStart(3, "0")} - ${name}.mp4`;
 }
 
+function batchPageLabel(pageUrl) {
+  try {
+    const url = new URL(pageUrl);
+    return `${url.host}${url.pathname}`;
+  } catch {
+    return "腾讯会议页面";
+  }
+}
+
+function transcriptExportTimestamp(date = new Date()) {
+  const pad = (value) => String(value).padStart(2, "0");
+  return `${date.getFullYear()}${pad(date.getMonth() + 1)}${pad(date.getDate())}_${pad(date.getHours())}${pad(date.getMinutes())}${pad(date.getSeconds())}`;
+}
+
+function transcriptTaskTitle(task) {
+  return normalizeRecordingTitle(task.recordingTitle)
+    || normalizeRecordingTitle(task.pageTitle)
+    || `第${task.index + 1}个视频`;
+}
+
+function transcriptFilename(task) {
+  return `${safeFilenamePart(transcriptTaskTitle(task)) || `第${task.index + 1}个视频`}.txt`;
+}
+
+function transcriptUnifiedFilename(state) {
+  return state.transcriptOutputFile || `腾讯会议逐字稿_${transcriptExportTimestamp()}.txt`;
+}
+
+function transcriptOutputFolder(state) {
+  return state.transcriptOutputDirectory || `腾讯会议逐字稿_${transcriptExportTimestamp()}`;
+}
+
+function downloadBatchText(text, filename) {
+  return new Promise((resolve, reject) => {
+    const objectUrl = URL.createObjectURL(new Blob(["\uFEFF", text], { type: "text/plain;charset=utf-8" }));
+    chrome.downloads.download({
+      url: objectUrl,
+      filename,
+      saveAs: false,
+      conflictAction: "uniquify"
+    }, (downloadId) => {
+      const error = chrome.runtime.lastError;
+      URL.revokeObjectURL(objectUrl);
+      if (error || !Number.isInteger(downloadId)) {
+        reject(new Error(error?.message || "TXT 导出失败。"));
+        return;
+      }
+      resolve(downloadId);
+    });
+  });
+}
+
+async function exportTranscriptTask(state, task) {
+  if (state.transcriptExportMode !== "hierarchical") return;
+  const filename = `${transcriptOutputFolder(state)}/${transcriptFilename(task)}`;
+  await downloadBatchText(task.transcriptText, filename);
+  task.filename = transcriptFilename(task);
+  await appendBatchLog("transcript_exported", state, `已导出：${filename}`);
+}
+
+async function finalizeTranscriptExport(state) {
+  if (state.taskType !== "transcript") return;
+  if (state.transcriptExportMode === "hierarchical") {
+    state.transcriptOutputFile = "";
+    return;
+  }
+  const completedTasks = state.tasks.filter((task) => task.status === "complete");
+  if (!completedTasks.length) return;
+  const content = completedTasks
+    .map((task) => `===== 视频${task.index + 1}${transcriptTaskTitle(task)} =====\n\n${task.transcriptText || ""}`)
+    .join("\n\n");
+  const filename = transcriptUnifiedFilename(state);
+  await downloadBatchText(content, filename);
+  state.transcriptOutputFile = filename;
+  await appendBatchLog("transcript_exported", state, `已导出统一文件：${filename}`);
+}
+
 function selectBatchCandidate(candidates, preference) {
   const mp4 = candidates.filter((candidate) => candidate.kind === "mp4");
   if (!mp4.length) return { candidate: null, waiting: true };
@@ -1207,7 +1297,7 @@ async function ensureBatchWorker(state, task) {
   state.statusMessage = `正在打开第 ${task.index + 1} / ${state.tasks.length} 条…`;
   await saveBatchState(state);
   await appendBatchLog("worker_tab_created", state, "工作标签页已创建");
-  await appendBatchLog("worker_navigating", state, `正在打开第 ${task.index + 1} 条`);
+  await appendBatchLog("worker_navigating", state, `正在打开第 ${task.index + 1} 条：${batchPageLabel(task.pageUrl)}`);
   return tab.id;
 }
 
@@ -1228,6 +1318,42 @@ async function failBatchTask(state, task, error) {
   queueBatchAdvance();
 }
 
+async function extractBatchTranscript(state, task, workerTabId) {
+  if (Date.now() - Number(task.phaseStartedAt || 0) > TRANSCRIPT_EXTRACT_TIMEOUT_MS) {
+    return failBatchTask(state, task, "逐字稿提取超时。");
+  }
+
+  task.status = "extracting";
+  task.phaseStartedAt = Date.now();
+  state.statusMessage = `正在采集第 ${task.index + 1} / ${state.tasks.length} 条逐字稿…`;
+  await saveBatchState(state);
+  await appendBatchLog("transcript_extract_started", state, `开始提取：${batchPageLabel(task.pageUrl)}`);
+
+  try {
+    const result = await chrome.tabs.sendMessage(workerTabId, { type: "runBatchTranscript" });
+    if (!result?.transcriptFound || typeof result.fullText !== "string" || !result.fullText.trim()) {
+      return failBatchTask(state, task, "页面中未找到逐字稿正文。");
+    }
+    const page = await getPageInfo(workerTabId);
+    task.pageTitle = result.pageTitle || page.title || task.pageTitle || "";
+    task.recordingTitle = result.recordingTitle || page.recordingTitle || task.recordingTitle || "";
+    task.transcriptText = result.fullText.trim();
+    task.paragraphCount = Number(result.paragraphCount) || 0;
+    task.textLength = task.transcriptText.length;
+    await appendBatchLog("transcript_extracted", state, `提取完成：${task.textLength} 字，${task.paragraphCount} 段`);
+    await exportTranscriptTask(state, task);
+    task.status = "complete";
+    task.error = "";
+    task.phaseStartedAt = 0;
+    state.statusMessage = `第 ${task.index + 1} / ${state.tasks.length} 条逐字稿已完成。`;
+    await saveBatchState(state);
+    await appendBatchLog("task_complete", state, `逐字稿任务完成：${transcriptTaskTitle(task)}`);
+    queueBatchAdvance();
+  } catch (error) {
+    await failBatchTask(state, task, error?.message || "逐字稿提取失败。");
+  }
+}
+
 async function advanceBatchQueue() {
   if (batchAdvancing) return;
   batchAdvancing = true;
@@ -1240,8 +1366,19 @@ async function advanceBatchQueue() {
     if (!task || ["complete", "failed"].includes(task.status)) {
       const nextIndex = nextPendingBatchIndex(state);
       if (nextIndex < 0) {
+        try {
+          await finalizeTranscriptExport(state);
+        } catch (error) {
+          state.error = safeBatchLogText(error?.message || "统一 TXT 导出失败。");
+          state.statusMessage = `批量完成，但导出失败：${state.error}`;
+          await saveBatchState(state);
+          await appendBatchLog("transcript_export_failed", state, state.error);
+        }
         state.status = "completed";
-        state.statusMessage = "批量任务已完成。";
+        if (!state.error) {
+          const failedCount = state.tasks.filter((item) => item.status === "failed").length;
+          state.statusMessage = failedCount ? `批量任务已完成，但有 ${failedCount} 个任务失败。` : "批量任务已完成。";
+        }
         await appendBatchLog("queue_complete", state, "全部任务已处理");
         await closeBatchWorker(state);
         return;
@@ -1319,6 +1456,14 @@ async function advanceBatchQueue() {
       scheduleBatchTick();
       return;
     }
+
+    if (state.taskType === "transcript") {
+      if (task.status === "detecting" || task.status === "extracting") {
+        return extractBatchTranscript(state, task, workerTabId);
+      }
+      return;
+    }
+
     if (task.status !== "detecting" && task.status !== "preparing") return;
     if (Date.now() - Number(task.phaseStartedAt || 0) > MEDIA_DETECT_TIMEOUT_MS) {
         return failBatchTask(state, task, task.status === "preparing" ? "媒体上下文准备失败。" : "未发现 MP4。");
@@ -1420,23 +1565,38 @@ async function startBatch(message) {
     .filter((item) => typeof item?.url === "string" && /^https?:\/\/meeting\.tencent\.com\/(?:crm|cw)\//i.test(item.url))
     .map((item) => item.url);
   const previous = await getBatchState();
+  const taskType = ["video", "transcript"].includes(message.taskType) ? message.taskType : previous.taskType || "video";
+  const transcriptExportMode = ["unified", "hierarchical"].includes(message.transcriptExportMode)
+    ? message.transcriptExportMode
+    : previous.transcriptExportMode || "hierarchical";
   await appendBatchLog("batch_start_requested", previous, `请求启动 ${accepted.length} 条`);
   if (!accepted.length) throw new Error("请先解析至少一条腾讯会议链接。");
   if (previous.status === "running") return previous;
   if (previous.status === "paused" && previous.tasks.length) return resumeBatch(message.mediaPreference);
-  const health = await checkLocalDownloader();
-  if (!health.ok) {
-    await appendBatchLog("batch_health_failed", previous, health.error || "本地组件不可用");
-    throw new Error(health.error || "本地组件暂时不可用，请稍后重试。");
+  if (taskType === "video") {
+    const health = await checkLocalDownloader();
+    if (!health.ok) {
+      await appendBatchLog("batch_health_failed", previous, health.error || "本地组件不可用");
+      throw new Error(health.error || "本地组件暂时不可用，请稍后重试。");
+    }
+    await appendBatchLog("batch_health_ok", previous, "本地下载组件已就绪");
   }
-  await appendBatchLog("batch_health_ok", previous, "本地下载组件已就绪");
+  const exportTimestamp = transcriptExportTimestamp();
   const state = {
     ...emptyBatchState(),
     status: "starting",
     startedAt: new Date().toISOString(),
+    taskType,
+    transcriptExportMode,
+    transcriptOutputDirectory: taskType === "transcript" && transcriptExportMode === "hierarchical"
+      ? `腾讯会议逐字稿_${exportTimestamp}`
+      : "",
+    transcriptOutputFile: taskType === "transcript" && transcriptExportMode === "unified"
+      ? `腾讯会议逐字稿_${exportTimestamp}.txt`
+      : "",
     tasks: accepted.map((pageUrl, index) => ({
       index, pageUrl, status: "pending", pageTitle: "", recordingTitle: "", filename: "", taskId: "", bytes: 0,
-      totalBytes: null, progress: null, error: ""
+      totalBytes: null, progress: null, error: "", transcriptText: "", paragraphCount: 0, textLength: 0
     }))
   };
   state.mediaPreference = ["auto", "screen", "speaker"].includes(message.mediaPreference)
@@ -1498,13 +1658,14 @@ async function notifyBatchMetadata(tabId, metadata) {
   if (state.status !== "running" || state.workerTabId !== tabId || !task) return;
   task.pageTitle = metadata.pageTitle || task.pageTitle || "";
   task.recordingTitle = metadata.recordingTitle || task.recordingTitle || "";
+  if (task.status === "extracting" || task.status === "complete") return;
   if (task.status === "navigating") {
     task.status = "detecting";
     task.phaseStartedAt = Date.now();
   }
-  state.statusMessage = "正在检测 MP4…";
+  state.statusMessage = state.taskType === "transcript" ? "页面已加载，准备采集逐字稿…" : "正在检测 MP4…";
   await saveBatchState(state);
-  await appendBatchLog("metadata_received", state, "已收到页面信息");
+  await appendBatchLog("metadata_received", state, state.taskType === "transcript" ? `已收到页面信息：${batchPageLabel(metadata.pageUrl)}` : "已收到页面信息");
   queueBatchAdvance();
 }
 
@@ -1574,11 +1735,37 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   }
 
   if (message?.type === "transcriptProgress" && sender.tab?.id >= 0) {
-    void chrome.runtime.sendMessage({
-      type: "transcriptProgress",
-      tabId: sender.tab.id,
-      progress: message.progress
-    }).catch(() => undefined);
+    void (async () => {
+      const state = await getBatchState();
+      const task = batchTask(state);
+      const progress = message.progress || {};
+      if (state.status !== "running" || state.taskType !== "transcript" || state.workerTabId !== sender.tab.id || !task) {
+        void chrome.runtime.sendMessage({
+          type: "transcriptProgress",
+          tabId: sender.tab.id,
+          progress
+        }).catch(() => undefined);
+        return;
+      }
+      task.status = "extracting";
+      task.paragraphCount = Math.max(0, Number(progress.paragraphCount) || 0);
+      task.textLength = Math.max(0, Number(progress.textLength) || 0);
+      state.statusMessage = `正在采集第 ${task.index + 1} / ${state.tasks.length} 条逐字稿：${task.paragraphCount} 段，${task.textLength} 字。`;
+      const bucket = Math.floor(task.textLength / 1000);
+      const shouldLog = bucket !== task.transcriptProgressBucket;
+      task.transcriptProgressBucket = bucket;
+      await saveBatchState(state);
+      if (shouldLog) await appendBatchLog("transcript_progress", state, state.statusMessage);
+      void chrome.runtime.sendMessage({
+        type: "transcriptProgress",
+        tabId: sender.tab.id,
+        progress: {
+          stage: progress.stage || "滚动采集中",
+          paragraphCount: task.paragraphCount,
+          textLength: task.textLength
+        }
+      }).catch(() => undefined);
+    })().catch(() => undefined);
     return;
   }
 
@@ -1741,9 +1928,9 @@ chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
       if (state.status !== "running" || state.workerTabId !== tabId || !task || task.status !== "navigating") return;
       task.status = "detecting";
       task.phaseStartedAt = Date.now();
-      state.statusMessage = "正在检测 MP4…";
+      state.statusMessage = state.taskType === "transcript" ? "页面加载完成，准备采集逐字稿…" : "正在检测 MP4…";
       await saveBatchState(state);
-      await appendBatchLog("page_loaded", state, "页面加载完成");
+      await appendBatchLog("page_loaded", state, state.taskType === "transcript" ? `页面加载完成：${batchPageLabel(tab?.url || task.pageUrl)}` : "页面加载完成");
       queueBatchAdvance();
     })();
   }

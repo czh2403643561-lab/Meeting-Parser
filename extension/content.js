@@ -316,9 +316,12 @@ async function extractFullTranscript() {
 }
 
 async function runPageDiagnostic() {
+  const titleDetails = extractRecordingTitleDetails();
   const result = {
     pageUrl: location.href,
     pageTitle: document.title,
+    recordingTitle: titleDetails.title,
+    recordingTitleSource: titleDetails.source,
     pageDetected: isTencentRecordingPage(),
     videoCount: document.querySelectorAll("video").length
   };
@@ -327,6 +330,19 @@ async function runPageDiagnostic() {
   console.info("[diagnostic] transcriptFound", Boolean(transcript.transcriptFound));
   console.info("[diagnostic] textLength", transcript.textLength || 0);
   return { ...result, ...transcript };
+}
+
+async function runBatchTranscriptExtraction() {
+  const transcriptTab = [...document.querySelectorAll("button, [role=\"tab\"]")]
+    .find((element) => String(element.textContent || "").replace(/\s+/gu, "").trim() === "逐字稿");
+  transcriptTab?.click();
+  await waitForTranscriptRender(500);
+  for (let attempt = 0; attempt < 5; attempt += 1) {
+    const result = await runPageDiagnostic();
+    if (result.transcriptFound) return result;
+    await waitForTranscriptRender(500);
+  }
+  return runPageDiagnostic();
 }
 
 function visibleTitleElement(element) {
@@ -489,6 +505,12 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
   }
   if (message?.type === "runPageDiagnostic") {
     runPageDiagnostic()
+      .then(sendResponse)
+      .catch(() => sendResponse({ transcriptFound: false }));
+    return true;
+  }
+  if (message?.type === "runBatchTranscript") {
+    runBatchTranscriptExtraction()
       .then(sendResponse)
       .catch(() => sendResponse({ transcriptFound: false }));
     return true;
