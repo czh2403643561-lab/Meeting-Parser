@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import json
+import os
 import queue
 import re
 import shutil
@@ -47,6 +49,31 @@ def process_creation_flags() -> int:
     if sys.platform == "win32":
         return getattr(subprocess, "CREATE_NO_WINDOW", 0)
     return 0
+
+
+def config_file_path() -> Path:
+    local_app_data = os.environ.get("LOCALAPPDATA")
+    if local_app_data:
+        return Path(local_app_data) / "MeetingParser" / "config.json"
+    return Path.home() / ".meetingparser" / "config.json"
+
+
+def load_output_folder() -> Path | None:
+    try:
+        payload = json.loads(config_file_path().read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError, TypeError):
+        return None
+    output_folder = payload.get("outputFolder") if isinstance(payload, dict) else None
+    if not isinstance(output_folder, str) or not output_folder.strip():
+        return None
+    return Path(output_folder)
+
+
+def save_output_folder(output_folder: Path | None) -> None:
+    path = config_file_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload = {"outputFolder": str(output_folder) if output_folder else ""}
+    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
 def format_bytes(value: int) -> str:
@@ -99,6 +126,7 @@ def probe_duration(ffprobe_path: Path, input_path: Path) -> float:
 def convert_mp4_to_mp3(
     input_path: Path,
     *,
+    output_directory: Path | None = None,
     ffmpeg_path: Path | None = None,
     ffprobe_path: Path | None = None,
     progress_callback: ProgressCallback | None = None,
@@ -109,7 +137,11 @@ def convert_mp4_to_mp3(
         raise RuntimeError("本地 FFmpeg 组件缺失，请重新安装 Meeting Parser。")
 
     duration = probe_duration(ffprobe_path, input_path)
-    output_path = input_path.with_suffix(".mp3")
+    if output_directory:
+        output_directory.mkdir(parents=True, exist_ok=True)
+        output_path = output_directory / f"{input_path.stem}.mp3"
+    else:
+        output_path = input_path.with_suffix(".mp3")
     command = [
         str(ffmpeg_path),
         "-hide_banner",
@@ -169,6 +201,10 @@ def convert_mp4_to_mp3(
     finally:
         process.wait()
         stderr_thread.join(timeout=2)
+        if process.stdout:
+            process.stdout.close()
+        if process.stderr:
+            process.stderr.close()
 
     if process.returncode != 0:
         message = "".join(stderr_lines).strip() or "FFmpeg 转换失败。"
@@ -189,6 +225,7 @@ class MeetingParserTool(tk.Tk):
         self.events: queue.Queue[tuple] = queue.Queue()
         self.conversion_running = False
         self.log_visible = False
+        self.output_folder = load_output_folder()
         self._build_ui()
         self.after(100, self._poll_events)
 
@@ -215,6 +252,21 @@ class MeetingParserTool(tk.Tk):
         self.clear_button = ttk.Button(feature_frame, text="清空列表", command=self._clear_files)
         self.clear_button.pack(side="left", padx=(10, 0))
         ttk.Button(feature_frame, text="文件处理（预留）", state=tk.DISABLED).pack(side="right")
+
+        output_frame = ttk.LabelFrame(container, text="输出位置", padding=10)
+        output_frame.pack(fill="x", pady=(14, 0))
+        ttk.Label(output_frame, text="当前路径：").pack(side="left")
+        self.output_folder_var = tk.StringVar()
+        ttk.Label(
+            output_frame,
+            textvariable=self.output_folder_var,
+            style="Subtitle.TLabel",
+        ).pack(side="left", fill="x", expand=True, padx=(4, 12))
+        ttk.Button(output_frame, text="选择文件夹", command=self._choose_output_folder).pack(side="left")
+        ttk.Button(output_frame, text="打开文件夹", command=self._open_output_folder).pack(
+            side="left", padx=(8, 0)
+        )
+        self._refresh_output_folder()
 
         list_frame = ttk.LabelFrame(container, text="MP4 转 MP3", padding=10)
         list_frame.pack(fill="both", expand=True, pady=(14, 0))
@@ -288,6 +340,42 @@ class MeetingParserTool(tk.Tk):
         self._refresh_summary()
         self.status_label.configure(text="请选择 MP4 文件开始。")
 
+    def _refresh_output_folder(self) -> None:
+        self.output_folder_var.set(str(self.output_folder) if self.output_folder else "MP4 所在目录（默认）")
+
+    def _choose_output_folder(self) -> None:
+        initial_directory = str(self.output_folder) if self.output_folder else ""
+        selected = filedialog.askdirectory(
+            title="选择 MP3 输出文件夹",
+            initialdir=initial_directory or str(Path.home()),
+        )
+        if not selected:
+            return
+        self.output_folder = Path(selected).resolve()
+        try:
+            save_output_folder(self.output_folder)
+        except OSError as error:
+            self.status_label.configure(text=f"输出目录设置未保存：{error}")
+            return
+        self._refresh_output_folder()
+        self.status_label.configure(text=f"已设置输出目录：{self.output_folder}")
+
+    def _open_output_folder(self) -> None:
+        output_folder = self.output_folder
+        if output_folder is None:
+            output_folder = self.tasks[0].path.parent if self.tasks else None
+        if output_folder is None:
+            self.status_label.configure(text="请先选择输出文件夹或添加 MP4 文件。")
+            return
+        try:
+            output_folder.mkdir(parents=True, exist_ok=True)
+            if sys.platform == "win32":
+                os.startfile(str(output_folder))
+            else:
+                subprocess.Popen(["xdg-open", str(output_folder)])
+        except OSError as error:
+            self.status_label.configure(text=f"无法打开输出文件夹：{error}")
+
     def _start_conversion(self) -> None:
         if self.conversion_running:
             return
@@ -314,7 +402,11 @@ class MeetingParserTool(tk.Tk):
                 def on_progress(percent: float, speed: str, eta: str) -> None:
                     self.events.put(("progress", index, percent, speed, eta))
 
-                convert_mp4_to_mp3(task.path, progress_callback=on_progress)
+                convert_mp4_to_mp3(
+                    task.path,
+                    output_directory=self.output_folder,
+                    progress_callback=on_progress,
+                )
             except Exception as error:  # noqa: BLE001
                 self.events.put(("complete", index, False, str(error)))
             else:
