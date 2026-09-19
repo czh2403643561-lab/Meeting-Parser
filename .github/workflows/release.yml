@@ -30,6 +30,10 @@ jobs:
         shell: powershell
         run: python -m PyInstaller --version
 
+      - name: Install FFmpeg build dependency
+        shell: powershell
+        run: choco install ffmpeg --no-progress -y
+
       - name: Install Inno Setup 6
         shell: powershell
         run: choco install innosetup --no-progress -y
