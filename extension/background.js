@@ -43,6 +43,7 @@ let nativeHelloPromise = null;
 let nativeHelloWaiter = null;
 const nativeDownloadStates = new Map();
 const nativePendingStarts = new Map();
+const nativePendingTools = new Map();
 let companionInstallationMode = false;
 let companionInstallProbeArmed = false;
 let lastCompanionProbeAt = 0;
@@ -599,6 +600,15 @@ function handleNativeMessage(message) {
     nativeHelloWaiter = null;
     return;
   }
+  if (message?.type === "toolStatus" && nativeTaskId(message.requestId)) {
+    const pending = nativePendingTools.get(message.requestId);
+    if (!pending) return;
+    nativePendingTools.delete(message.requestId);
+    clearTimeout(pending.timer);
+    if (message.status === "launched") pending.resolve({ ok: true });
+    else pending.reject(new Error(message.error || "本地工具启动失败。"));
+    return;
+  }
   if (message?.type !== "downloadStatus" || !nativeTaskId(message.requestId)) return;
   const state = {
     taskId: message.requestId,
@@ -630,6 +640,11 @@ function handleNativeDisconnect(disconnectMessage = "") {
     clearTimeout(pending.timer);
     pending.reject(nativeDisconnectError(disconnectMessage));
     nativePendingStarts.delete(taskId);
+  }
+  for (const [requestId, pending] of nativePendingTools) {
+    clearTimeout(pending.timer);
+    pending.reject(nativeDisconnectError(disconnectMessage));
+    nativePendingTools.delete(requestId);
   }
   for (const [taskId, state] of nativeDownloadStates) {
     if (["complete", "failed"].includes(state.status)) continue;
@@ -745,6 +760,32 @@ async function checkLocalDownloader() {
   } catch (error) {
     return { ok: false, error: error.message, state: localDownloaderState };
   }
+}
+
+async function openLocalTool() {
+  const health = await ensureLocalDownloader();
+  if (!health.ok || !nativePort) throw new Error("本地组件暂时不可用，请先完成安装。");
+  const requestId = globalThis.crypto?.randomUUID
+    ? crypto.randomUUID()
+    : `tool-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+  const result = new Promise((resolve, reject) => {
+    const timer = setTimeout(() => {
+      nativePendingTools.delete(requestId);
+      reject(new Error("本地工具启动响应超时。"));
+    }, 5000);
+    nativePendingTools.set(requestId, { resolve, reject, timer });
+  });
+  try {
+    nativePort.postMessage({ type: "openTool", requestId });
+  } catch (error) {
+    const pending = nativePendingTools.get(requestId);
+    if (pending) {
+      clearTimeout(pending.timer);
+      nativePendingTools.delete(requestId);
+      pending.reject(error);
+    }
+  }
+  return result;
 }
 
 async function startNativeDownload(payload) {
@@ -1780,6 +1821,13 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     checkLocalDownloader()
       .then((status) => sendResponse(status))
       .catch((error) => sendResponse({ error: error.message }));
+    return true;
+  }
+
+  if (message?.type === "openLocalTool") {
+    openLocalTool()
+      .then((result) => sendResponse(result))
+      .catch((error) => sendResponse({ ok: false, error: error.message }));
     return true;
   }
 

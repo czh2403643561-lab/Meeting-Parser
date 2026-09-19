@@ -12,7 +12,7 @@ if ([string]::IsNullOrWhiteSpace($SourceDirectory)) {
 }
 
 $source = Resolve-Path -LiteralPath $SourceDirectory -ErrorAction Stop
-$requiredFiles = @("MeetingParserHost.exe")
+$requiredFiles = @("MeetingParserHost.exe", "MeetingParserTool.exe")
 foreach ($file in $requiredFiles) {
   if (-not (Test-Path -LiteralPath (Join-Path $source $file) -PathType Leaf)) {
     throw "安装包缺少：$file。请先运行 scripts\build_companion.ps1。"
@@ -23,6 +23,7 @@ $installDirectory = Join-Path $env:LOCALAPPDATA $MeetingParserInstallDirectoryNa
 $nativeManifestPath = Join-Path $installDirectory "com.meetingparser.helper.json"
 $ownedExecutables = @(
   (Join-Path $installDirectory "MeetingParserHost.exe"),
+  (Join-Path $installDirectory "MeetingParserTool.exe"),
   (Join-Path $installDirectory "MeetingParserNativeHost.exe"),
   (Join-Path $installDirectory "MeetingParserDownloader.exe")
 )

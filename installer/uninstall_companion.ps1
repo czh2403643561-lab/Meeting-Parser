@@ -8,6 +8,7 @@ $ErrorActionPreference = "Stop"
 $installDirectory = Join-Path $env:LOCALAPPDATA $MeetingParserInstallDirectoryName
 $ownedExecutables = @(
   (Join-Path $installDirectory "MeetingParserHost.exe"),
+  (Join-Path $installDirectory "MeetingParserTool.exe"),
   (Join-Path $installDirectory "MeetingParserNativeHost.exe"),
   (Join-Path $installDirectory "MeetingParserDownloader.exe")
 )

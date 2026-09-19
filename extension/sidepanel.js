@@ -64,6 +64,8 @@ const recheckLocalComponentButton = document.querySelector("#recheck-local-compo
 const onboardingFeedback = document.querySelector("#onboarding-feedback");
 const onboardingTitle = document.querySelector("#onboarding-title");
 const onboardingDescription = document.querySelector("#onboarding-description");
+const openLocalToolButton = document.querySelector("#open-local-tool");
+const toolFeedback = document.querySelector("#tool-feedback");
 
 const labels = {
   mp4: "MP4",
@@ -150,6 +152,9 @@ function renderLocalServiceStatus(state) {
     recheckLocalComponentButton.hidden = true;
     onboardingFeedback.textContent = "";
   }
+  openLocalToolButton.disabled = normalized !== "ready";
+  if (normalized !== "ready") toolFeedback.textContent = "安装本地组件后即可使用。";
+  else if (!openLocalToolButton.dataset.busy) toolFeedback.textContent = "";
   updateDownloadControls();
 }
 
@@ -1150,6 +1155,21 @@ refreshButton.addEventListener("click", refresh);
 runPageDiagnosticButton.addEventListener("click", () => void runPageDiagnostic());
 installLocalComponentButton.addEventListener("click", () => void beginCompanionInstallation());
 recheckLocalComponentButton.addEventListener("click", () => void recheckCompanionInstallation());
+openLocalToolButton.addEventListener("click", async () => {
+  if (openLocalToolButton.dataset.busy || localComponentState !== "ready") return;
+  openLocalToolButton.dataset.busy = "true";
+  openLocalToolButton.disabled = true;
+  toolFeedback.textContent = "正在打开本地工具…";
+  try {
+    const result = await chrome.runtime.sendMessage({ type: "openLocalTool" });
+    toolFeedback.textContent = result?.ok ? "本地工具已打开。" : result?.error || "本地工具启动失败。";
+  } catch (error) {
+    toolFeedback.textContent = error.message || "本地工具启动失败。";
+  } finally {
+    delete openLocalToolButton.dataset.busy;
+    openLocalToolButton.disabled = localComponentState !== "ready";
+  }
+});
 void restoreCollapseState().then(() => {
   const logsVisible = collapseState["batch-logs"] === true;
   batchLogOutput.hidden = !logsVisible;

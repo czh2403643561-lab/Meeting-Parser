@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import queue
 import struct
+import subprocess
 import sys
 import threading
 import time
@@ -91,6 +92,37 @@ def failed_payload(request_id: str, error: str) -> dict:
     }
 
 
+def companion_directory() -> Path:
+    executable = Path(sys.executable).resolve()
+    if executable.name.lower() == "meetingparserhost.exe":
+        return executable.parent
+    return Path(__file__).resolve().parent
+
+
+def launch_desktop_tool() -> None:
+    tool_path = companion_directory() / "MeetingParserTool.exe"
+    if not tool_path.is_file():
+        raise FileNotFoundError("本地工具尚未安装。")
+    creation_flags = 0
+    if sys.platform == "win32":
+        creation_flags = getattr(subprocess, "DETACHED_PROCESS", 0) | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+    subprocess.Popen(
+        [str(tool_path)],
+        cwd=str(tool_path.parent),
+        close_fds=True,
+        creationflags=creation_flags,
+    )
+
+
+def tool_status_payload(request_id: str, status: str, error: str = "") -> dict:
+    return {
+        "type": "toolStatus",
+        "requestId": request_id,
+        "status": status,
+        "error": error,
+    }
+
+
 def main() -> None:
     messages: queue.Queue[dict | None] = queue.Queue()
     threading.Thread(target=reader, args=(messages,), daemon=True).start()
@@ -119,6 +151,18 @@ def main() -> None:
             message_type = message.get("type")
             if message_type == "hello":
                 if not send_message({"type": "hello", "version": COMPANION_VERSION}, output_lock):
+                    return
+            elif message_type == "openTool":
+                request_id = str(message.get("requestId", "")).strip()
+                if not request_id:
+                    continue
+                try:
+                    launch_desktop_tool()
+                except (FileNotFoundError, OSError) as error:
+                    payload = tool_status_payload(request_id, "failed", str(error))
+                else:
+                    payload = tool_status_payload(request_id, "launched")
+                if not send_message(payload, output_lock):
                     return
             elif message_type == "startDownload":
                 request_id = str(message.get("requestId", "")).strip()

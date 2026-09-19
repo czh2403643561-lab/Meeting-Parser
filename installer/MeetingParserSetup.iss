@@ -23,6 +23,7 @@ FinishedLabel=Meeting Parser 本地组件已安装完成。%n现在可以返回�
 
 [Files]
 Source: "{#CompanionDir}\MeetingParserHost.exe"; DestDir: "{app}"; Flags: ignoreversion
+Source: "{#CompanionDir}\MeetingParserTool.exe"; DestDir: "{app}"; Flags: ignoreversion
 
 [Registry]
 Root: HKCU; Subkey: "Software\Google\Chrome\NativeMessagingHosts\com.meetingparser.helper"; ValueType: string; ValueName: ""; ValueData: "{app}\com.meetingparser.helper.json"; Flags: uninsdeletekey
@@ -39,6 +40,7 @@ Type: files; Name: "{app}\MeetingParserNativeHost.exe"
 Filename: "{sys}\taskkill.exe"; Parameters: "/F /T /IM MeetingParserHost.exe"; Flags: runhidden waituntilterminated; RunOnceId: "StopMeetingParserHost"
 Filename: "{sys}\taskkill.exe"; Parameters: "/F /T /IM MeetingParserNativeHost.exe"; Flags: runhidden waituntilterminated; RunOnceId: "StopMeetingParserNativeHost"
 Filename: "{sys}\taskkill.exe"; Parameters: "/F /T /IM MeetingParserDownloader.exe"; Flags: runhidden waituntilterminated; RunOnceId: "StopMeetingParserDownloader"
+Filename: "{sys}\taskkill.exe"; Parameters: "/F /T /IM MeetingParserTool.exe"; Flags: runhidden waituntilterminated; RunOnceId: "StopMeetingParserTool"
 
 [Code]
 procedure WriteNativeHostManifest;
@@ -71,6 +73,7 @@ begin
   StopOwnProcess('MeetingParserHost.exe');
   StopOwnProcess('MeetingParserNativeHost.exe');
   StopOwnProcess('MeetingParserDownloader.exe');
+  StopOwnProcess('MeetingParserTool.exe');
   Result := '';
 end;
 

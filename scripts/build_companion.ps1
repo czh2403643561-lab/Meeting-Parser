@@ -35,5 +35,6 @@ if ($LASTEXITCODE -ne 0) {
 New-Item -ItemType Directory -Force -Path $workRoot, $distRoot | Out-Null
 Build-CompanionExecutable -Name "MeetingParserDownloader" -Source (Join-Path $projectRoot "local_downloader.py")
 Build-CompanionExecutable -Name "MeetingParserHost" -Source (Join-Path $projectRoot "companion\native_host.py")
+Build-CompanionExecutable -Name "MeetingParserTool" -Source (Join-Path $projectRoot "companion\desktop_tool.py")
 
 Write-Output "构建完成：$distRoot"
