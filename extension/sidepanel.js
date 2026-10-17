@@ -26,6 +26,9 @@ const batchTab = document.querySelector("#batch-tab");
 const singleView = document.querySelector("#single-view");
 const batchView = document.querySelector("#batch-view");
 const batchFile = document.querySelector("#batch-file");
+const clearBatchHistoryButton = document.querySelector("#clear-batch-history");
+const copyInvalidBatchLinksButton = document.querySelector("#copy-invalid-batch-links");
+const copyFailedBatchLinksButton = document.querySelector("#copy-failed-batch-links");
 const batchLinks = document.querySelector("#batch-links");
 const parseBatchButton = document.querySelector("#parse-batch");
 const batchSummary = document.querySelector("#batch-summary");
@@ -84,8 +87,10 @@ let monitorTimer = null;
 let monitorToken = 0;
 let pendingFilename = "";
 let batchState = null;
-let batchDraft = { items: [], duplicateCount: 0, invalidCount: 0 };
+let batchDraft = { items: [], duplicateCount: 0, invalidCount: 0, invalidLinks: [], updatedAt: "" };
 let batchMonitorTimer = null;
+let batchUiGeneration = 0;
+let batchClearInProgress = false;
 let localComponentState = "checking";
 let setupPollTimer = null;
 let setupPollDeadline = 0;
@@ -163,7 +168,7 @@ function updateDownloadControls() {
   document.querySelectorAll(".download-candidate").forEach((button) => {
     button.disabled = !ready;
   });
-  if (!startBatchButton.dataset.busy) startBatchButton.disabled = !ready;
+  updateBatchActionButtons();
 }
 
 async function refreshLocalServiceStatus() {
@@ -381,16 +386,21 @@ function parseBatchLinks(text) {
   const seen = new Set();
   let duplicateCount = 0;
   let invalidCount = 0;
+  const invalidLinks = [];
 
   for (const line of text.split(/\r?\n/)) {
     const tokens = extractBatchUrlTokens(line.trim());
     if (!tokens.length) {
-      if (line.trim()) invalidCount += 1;
+      if (line.trim()) {
+        invalidCount += 1;
+        if (!/(?:cookie|authorization|token)\s*[:=]/i.test(line)) invalidLinks.push(line.trim());
+      }
       continue;
     }
     for (const value of tokens) {
       if (!acceptedBatchUrl(value)) {
         invalidCount += 1;
+        if (!/\.mp4(?:[?#]|$)/i.test(value) && !/(?:cookie|authorization|token)=/i.test(value)) invalidLinks.push(value);
         continue;
       }
       if (seen.has(value)) {
@@ -402,7 +412,7 @@ function parseBatchLinks(text) {
     }
   }
 
-  return { items, duplicateCount, invalidCount };
+  return { items, duplicateCount, invalidCount, invalidLinks };
 }
 
 const batchStatusLabels = {
@@ -433,7 +443,35 @@ function updateBatchModeControls() {
   const transcript = batchTaskType.value === "transcript";
   mediaPreferenceControl.hidden = transcript;
   transcriptExportControl.hidden = !transcript;
-  if (!startBatchButton.dataset.busy) startBatchButton.textContent = transcript ? "开始批量提取" : "开始批量下载";
+  updateBatchActionButtons();
+}
+
+function hasNewBatchDraft() {
+  return Boolean(batchDraft.items?.length && batchDraft.updatedAt && batchState?.tasks?.length
+    && (!batchState.startedAt || Date.parse(batchDraft.updatedAt) > Date.parse(batchState.startedAt)));
+}
+
+function updateBatchActionButtons() {
+  const status = batchClearInProgress ? "clearing" : batchState?.status || "idle";
+  const newDraft = hasNewBatchDraft();
+  const running = ["starting", "running", "clearing"].includes(status);
+  const resumeHistory = status === "paused" && !newDraft;
+  startBatchButton.hidden = running || resumeHistory;
+  pauseBatchButton.hidden = status !== "running";
+  resumeBatchButton.hidden = !resumeHistory;
+  resumeBatchButton.textContent = `继续历史${batchState?.taskType === "transcript" ? "逐字稿提取" : "视频下载"}`;
+  batchTaskType.disabled = running || resumeHistory;
+  batchLinks.disabled = running;
+  batchFile.disabled = running;
+  parseBatchButton.disabled = running;
+  mediaPreference.disabled = running;
+  transcriptExportMode.disabled = running;
+  startBatchButton.textContent = `${status === "completed" && !newDraft ? "重新开始" : "开始"}批量${batchTaskType.value === "transcript" ? "提取" : "下载"}`;
+  startBatchButton.disabled = Boolean(startBatchButton.dataset.busy) || !batchDraft.items?.length
+    || (batchTaskType.value === "video" && localComponentState !== "ready") || running;
+  clearBatchHistoryButton.disabled = batchClearInProgress;
+  copyInvalidBatchLinksButton.disabled = !(batchDraft.invalidLinks?.length);
+  copyFailedBatchLinksButton.disabled = !(batchState?.tasks || []).some((task) => task.status === "failed");
 }
 
 function renderBatchDraft(draft) {
@@ -445,7 +483,7 @@ function renderBatchDraft(draft) {
   batchSummary.textContent = count
     ? `已解析 ${count} 条，等待开始 · 重复 ${batchDraft.duplicateCount || 0} 条 · 无效 ${batchDraft.invalidCount || 0} 条`
     : "尚未解析";
-  if (!batchState?.tasks?.length) renderBatchItems(batchDraft.items || []);
+  renderBatchItems(batchDraft.items || []);
   updateBatchModeControls();
 }
 
@@ -502,10 +540,11 @@ function renderBatchOverview(counts) {
 function renderBatchState(state) {
   batchState = state;
   const tasks = state?.tasks || [];
-  if (!tasks.length && batchDraft.items?.length) {
+  if ((!tasks.length && batchDraft.items?.length) || (hasNewBatchDraft() && !["starting", "running", "clearing"].includes(state?.status))) {
     batchTotalProgress.hidden = true;
     batchProgress.hidden = true;
     renderBatchDraft(batchDraft);
+    if (state?.status === "paused") batchSummary.textContent += " · 存在暂停的历史任务";
     return;
   }
   const counts = batchCounts({ tasks });
@@ -513,10 +552,14 @@ function renderBatchState(state) {
   const current = tasks[state?.currentIndex] || null;
   renderBatchOverview({ ...counts, pending: waiting });
   batchListCount.textContent = counts.total ? `${counts.total} 条任务` : "暂无任务";
-  batchSummary.textContent = `总数 ${counts.total} · 完成 ${counts.complete || 0} · 失败 ${counts.failed || 0} · 待处理 ${waiting}`;
+  batchSummary.textContent = counts.total
+    ? `总数 ${counts.total} · 完成 ${counts.complete || 0} · 失败 ${counts.failed || 0} · 待处理 ${waiting}`
+    : "尚未解析链接";
   renderBatchItems(tasks);
 
   batchTotalProgress.hidden = counts.total === 0;
+  batchTotalBar.value = 0;
+  batchTotalLabel.textContent = "";
   if (counts.total) {
     const processed = (counts.complete || 0) + (counts.failed || 0);
     const percent = (processed / counts.total) * 100;
@@ -525,6 +568,13 @@ function renderBatchState(state) {
   }
 
   batchProgress.hidden = !current;
+  batchFileProgress.value = 0;
+  if (!current) {
+    batchCurrent.textContent = "当前任务";
+    batchStatus.textContent = "";
+    batchSize.textContent = "";
+    batchFileProgress.hidden = true;
+  }
   if (current) {
     batchCurrent.textContent = `当前第 ${current.index + 1} / ${counts.total}`;
     batchStatus.textContent = state.statusMessage || `${batchTaskStatusLabel(current)}${current.filename ? `：${current.filename}` : current.recordingTitle || current.pageTitle ? `：${current.recordingTitle || current.pageTitle}` : ""}`;
@@ -545,19 +595,14 @@ function renderBatchState(state) {
     }
   }
 
-  batchTaskType.value = ["video", "transcript"].includes(state?.taskType) ? state.taskType : "video";
-  mediaPreference.value = ["auto", "screen", "speaker"].includes(state?.mediaPreference) ? state.mediaPreference : "auto";
-  transcriptExportMode.value = ["unified", "hierarchical"].includes(state?.transcriptExportMode) ? state.transcriptExportMode : "hierarchical";
+  if (["starting", "running"].includes(state?.status) || (state?.status === "paused" && !hasNewBatchDraft())) {
+    batchTaskType.value = state.taskType;
+  }
   batchOutputPath.textContent = state?.transcriptOutputDirectory
     ? `输出目录：下载目录/${state.transcriptOutputDirectory}/`
     : state?.transcriptOutputFile ? `输出文件：下载目录/${state.transcriptOutputFile}` : "";
   updateBatchModeControls();
-  startBatchButton.hidden = ["starting", "running"].includes(state?.status);
-  pauseBatchButton.hidden = state?.status !== "running";
-  resumeBatchButton.hidden = state?.status !== "paused";
-  startBatchButton.textContent = state?.status === "completed"
-    ? (state.taskType === "transcript" ? "重新开始批量提取" : "重新开始批量下载")
-    : (state.taskType === "transcript" ? "开始批量提取" : "开始批量下载");
+  updateBatchActionButtons();
   if (state?.status === "paused" && !current?.taskId) {
     batchStatus.textContent = "批量已暂停。";
   }
@@ -595,14 +640,17 @@ function stopBatchMonitoring() {
 
 function monitorBatchState() {
   stopBatchMonitoring();
+  const generation = batchUiGeneration;
   const poll = async () => {
     try {
       const state = await chrome.runtime.sendMessage({ type: "getBatchState" });
+      if (generation !== batchUiGeneration) return;
       if (!state?.error) renderBatchState(state);
       if (["starting", "running"].includes(state?.status) || state?.tasks?.[state.currentIndex]?.status === "downloading") {
         batchMonitorTimer = setTimeout(poll, 800);
       }
     } catch {
+      if (generation !== batchUiGeneration) return;
       batchMonitorTimer = setTimeout(poll, 1000);
     }
   };
@@ -939,21 +987,26 @@ batchTab.addEventListener("click", () => setMode("batch"));
 batchTaskType.addEventListener("change", updateBatchModeControls);
 
 async function parseAndSaveBatchDraft() {
+  const generation = batchUiGeneration;
   const result = parseBatchLinks(batchLinks.value);
   try {
     const draft = await chrome.runtime.sendMessage({
       type: "saveBatchDraft",
       items: result.items,
       duplicateCount: result.duplicateCount,
-      invalidCount: result.invalidCount
+      invalidCount: result.invalidCount,
+      invalidLinks: result.invalidLinks
     });
     if (draft?.error) throw new Error(draft.error);
+    if (generation !== batchUiGeneration) return false;
     batchDraft = draft;
     if (draft.acceptedCount !== result.items.length) {
       throw new Error(`解析状态异常：前端 ${result.items.length} 条，后台接受 ${draft.acceptedCount || 0} 条`);
     }
-    batchState = null;
+    batchUiGeneration += 1;
+    stopBatchMonitoring();
     renderBatchDraft(draft);
+    if (batchState?.status === "paused") batchSummary.textContent += " · 存在暂停的历史任务";
     await refreshBatchLogs();
     showBatchFeedback(result.items.length ? `已解析 ${result.items.length} 条链接。` : "当前没有可处理的腾讯会议链接。");
     parseBatchButton.textContent = "重新解析";
@@ -993,6 +1046,13 @@ parseBatchButton.addEventListener("click", async () => {
 });
 
 startBatchButton.addEventListener("click", async () => {
+  if (!batchDraft.items?.length) {
+    showBatchFeedback("请先解析至少一条腾讯会议链接。");
+    return;
+  }
+  if (batchState?.status === "paused") {
+    if (!window.confirm("存在未完成历史任务，开始新任务将放弃旧队列。是否继续？")) return;
+  }
   if (batchTaskType.value === "video" && localComponentState !== "ready") {
     showBatchFeedback("请先安装或更新本地组件。");
     companionOnboarding.hidden = false;
@@ -1003,14 +1063,17 @@ startBatchButton.addEventListener("click", async () => {
   batchProgress.hidden = false;
   batchStatus.textContent = "正在启动批量任务…";
   showBatchFeedback("正在启动批量任务…");
-  if (batchTaskType.value === "video") renderLocalServiceStatus("starting");
   try {
     const state = await chrome.runtime.sendMessage({
       type: "startBatch",
       taskType: batchTaskType.value,
       mediaPreference: mediaPreference.value,
       transcriptExportMode: transcriptExportMode.value,
-      items: batchDraft.items
+      items: batchDraft.items,
+      duplicateCount: batchDraft.duplicateCount,
+      invalidCount: batchDraft.invalidCount,
+      invalidLinks: batchDraft.invalidLinks,
+      replacePaused: batchState?.status === "paused"
     });
     if (state?.error) throw new Error(state.error);
     renderBatchState(state);
@@ -1018,7 +1081,7 @@ startBatchButton.addEventListener("click", async () => {
     showBatchFeedback("批量任务已开始。");
   } catch (error) {
     batchSummary.textContent = error.message || "批量启动失败。";
-    showBatchFeedback("批量启动失败，请查看运行日志。");
+    showBatchFeedback(error.message || "批量启动失败，请查看运行日志。");
     await refreshBatchLogs();
     if (batchTaskType.value === "video") await refreshLocalServiceStatus();
   } finally {
@@ -1026,6 +1089,67 @@ startBatchButton.addEventListener("click", async () => {
     updateDownloadControls();
   }
 });
+
+clearBatchHistoryButton.addEventListener("click", async () => {
+  const active = ["starting", "running", "clearing"].includes(batchState?.status)
+    || batchState?.tasks?.[batchState.currentIndex]?.status === "downloading";
+  const prompt = "确定清空全部批量记录吗？\n将清空链接、任务、进度及运行日志。\n不会删除已经下载的文件。"
+    + (active ? "\n当前任务会安全结束，后续任务将停止。" : "");
+  if (!window.confirm(prompt)) return;
+  batchClearInProgress = true;
+  batchUiGeneration += 1;
+  stopBatchMonitoring();
+  updateBatchActionButtons();
+  showBatchFeedback(active ? "正在等待当前任务安全结束并清空历史…" : "正在清空批量历史…");
+  try {
+    const state = await chrome.runtime.sendMessage({ type: "clearBatchHistory" });
+    if (state?.error) throw new Error(state.error);
+    batchState = state;
+    batchDraft = { items: [], duplicateCount: 0, invalidCount: 0, invalidLinks: [], updatedAt: "" };
+    batchLinks.value = "";
+    batchFile.value = "";
+    batchTaskType.value = "video";
+    mediaPreference.value = "auto";
+    transcriptExportMode.value = "hierarchical";
+    batchTotalBar.value = 0;
+    batchTotalLabel.textContent = "";
+    batchFileProgress.value = 0;
+    batchCurrent.textContent = "当前任务";
+    batchStatus.textContent = "";
+    batchSize.textContent = "";
+    batchOutputPath.textContent = "";
+    batchLogOutput.textContent = "当前没有运行日志";
+    parseBatchButton.textContent = "解析链接";
+    renderBatchState(state);
+    showBatchFeedback("批量历史已清空。");
+  } catch (error) {
+    showBatchFeedback(`清空失败：${error.message || "未知错误"}`);
+    const state = await chrome.runtime.sendMessage({ type: "getBatchState" });
+    if (!state?.error) renderBatchState(state);
+  } finally {
+    batchClearInProgress = false;
+    updateBatchActionButtons();
+  }
+});
+
+async function copyBatchUrls(urls, emptyMessage) {
+  if (!urls.length) {
+    showBatchFeedback(emptyMessage);
+    return;
+  }
+  try {
+    await navigator.clipboard.writeText(urls.join("\n"));
+    showBatchFeedback(`已复制 ${urls.length} 条链接。`);
+  } catch (error) {
+    showBatchFeedback(`复制失败：${error.message || "剪贴板不可用"}`);
+  }
+}
+
+copyInvalidBatchLinksButton.addEventListener("click", () => void copyBatchUrls(batchDraft.invalidLinks || [], "没有无效链接。"));
+copyFailedBatchLinksButton.addEventListener("click", () => void copyBatchUrls(
+  (batchState?.tasks || []).filter((task) => task.status === "failed").map((task) => task.pageUrl),
+  "没有失败链接。"
+));
 
 pauseBatchButton.addEventListener("click", async () => {
   pauseBatchButton.disabled = true;
@@ -1137,8 +1261,9 @@ chrome.runtime.onMessage.addListener((message) => {
     });
   }
   if (message?.type === "batchStateChanged") {
+    const generation = batchUiGeneration;
     void chrome.runtime.sendMessage({ type: "getBatchState" }).then((state) => {
-      if (!state?.error) renderBatchState(state);
+      if (generation === batchUiGeneration && !state?.error) renderBatchState(state);
     });
   }
   if (message?.type === "batchLogChanged" && !batchLogOutput.hidden) void refreshBatchLogs();

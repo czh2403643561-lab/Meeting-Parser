@@ -114,6 +114,7 @@
             <h1>批量任务</h1>
             <p class="subtle-text">严格按顺序执行；工作标签页关闭后可继续任务。</p>
           </div>
+          <button id="clear-batch-history" class="secondary-button" type="button">清空历史</button>
         </div>
 
         <section class="panel batch-input-panel">
@@ -147,6 +148,7 @@
             </label>
           </div>
           <p id="batch-summary" class="batch-summary">尚未解析</p>
+          <button id="copy-invalid-batch-links" class="secondary-button" type="button" disabled>复制无效链接</button>
           <p id="batch-feedback" class="action-feedback" role="status" aria-live="polite"></p>
         </section>
 
@@ -196,6 +198,7 @@
             <button id="start-batch" type="button">开始批量任务</button>
             <button id="pause-batch" class="secondary-button" type="button" hidden>暂停</button>
             <button id="resume-batch" type="button" hidden>继续</button>
+            <button id="copy-failed-batch-links" class="secondary-button" type="button" disabled>复制失败链接</button>
           </div>
         </section>
 

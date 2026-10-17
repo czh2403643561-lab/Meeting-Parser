@@ -35,6 +35,15 @@ const tabPageStates = new Map();
 const pageRequestInfoByTab = new Map();
 let batchAdvancing = false;
 let batchLogQueue = Promise.resolve();
+let batchStateWriteQueue = Promise.resolve();
+let batchDraftWriteQueue = Promise.resolve();
+let batchAdvancePromise = null;
+let batchClearPromise = null;
+let batchClearing = false;
+let batchClearingTaskId = "";
+let batchStartPromise = null;
+let activeBatchRunId = null;
+let batchEpoch = 0;
 let localDownloaderStarting = null;
 let localDownloaderState = "checking";
 let keepAwakeRequested = false;
@@ -1025,6 +1034,7 @@ function armCompanionInstallProbe() {
 
 function emptyBatchState() {
   return {
+    runId: "",
     status: "idle",
     workerTabId: null,
     currentIndex: 0,
@@ -1073,6 +1083,7 @@ function persistedBatchTask(task, index) {
 
 function persistedBatchState(state) {
   return {
+    runId: typeof state?.runId === "string" ? state.runId : "",
     status: typeof state?.status === "string" ? state.status : "idle",
     workerTabId: Number.isInteger(state?.workerTabId) ? state.workerTabId : null,
     currentIndex: Number.isInteger(state?.currentIndex) ? Math.max(0, state.currentIndex) : 0,
@@ -1096,12 +1107,14 @@ function persistedBatchDraft(draft) {
       .map((item) => ({ url: item.url })),
     duplicateCount: Number.isFinite(draft?.duplicateCount) ? Math.max(0, Number(draft.duplicateCount)) : 0,
     invalidCount: Number.isFinite(draft?.invalidCount) ? Math.max(0, Number(draft.invalidCount)) : 0,
+    invalidLinks: Array.isArray(draft?.invalidLinks) ? draft.invalidLinks.filter((value) => typeof value === "string").map((value) => value.slice(0, 2048)) : [],
     updatedAt: typeof draft?.updatedAt === "string" ? draft.updatedAt : ""
   };
 }
 
 function updateBatchKeepAwake(state) {
-  const shouldKeepAwake = state?.status === "running";
+  const shouldKeepAwake = state?.status === "running"
+    || (state?.status === "clearing" && batchTask(state)?.status === "downloading");
   if (shouldKeepAwake && !keepAwakeRequested) {
     chrome.power.requestKeepAwake("system");
     keepAwakeRequested = true;
@@ -1113,6 +1126,7 @@ function updateBatchKeepAwake(state) {
 
 async function appendBatchLog(event, state, message = "", details = {}) {
   const write = batchLogQueue.catch(() => undefined).then(async () => {
+    if (batchClearing || (activeBatchRunId && state && state.runId !== activeBatchRunId)) return;
     const result = await chrome.storage.session.get(BATCH_LOG_KEY);
     const previous = Array.isArray(result[BATCH_LOG_KEY]) ? result[BATCH_LOG_KEY] : [];
     const entry = {
@@ -1136,6 +1150,7 @@ async function appendBatchLog(event, state, message = "", details = {}) {
 }
 
 async function getBatchDraft() {
+  const requestEpoch = batchEpoch;
   let result = await chrome.storage.local.get(BATCH_DRAFT_KEY);
   let draft = result[BATCH_DRAFT_KEY];
   if (!draft) {
@@ -1143,16 +1158,23 @@ async function getBatchDraft() {
     draft = legacy[BATCH_DRAFT_KEY];
     if (draft) {
       draft = persistedBatchDraft(draft);
-      await chrome.storage.local.set({ [BATCH_DRAFT_KEY]: draft });
-      await chrome.storage.session.remove(BATCH_DRAFT_KEY);
+      const migration = batchDraftWriteQueue.catch(() => undefined).then(async () => {
+        if (batchClearing || batchEpoch !== requestEpoch) return;
+        await chrome.storage.local.set({ [BATCH_DRAFT_KEY]: draft });
+        await chrome.storage.session.remove(BATCH_DRAFT_KEY);
+      });
+      batchDraftWriteQueue = migration;
+      await migration;
     }
   }
+  if (batchClearing || batchEpoch !== requestEpoch) return { items: [], duplicateCount: 0, invalidCount: 0, invalidLinks: [], updatedAt: "" };
   return draft && Array.isArray(draft.items)
     ? persistedBatchDraft(draft)
-    : { items: [], duplicateCount: 0, invalidCount: 0, updatedAt: "" };
+    : { items: [], duplicateCount: 0, invalidCount: 0, invalidLinks: [], updatedAt: "" };
 }
 
 async function getBatchState() {
+  const requestEpoch = batchEpoch;
   let result = await chrome.storage.local.get(BATCH_STATE_KEY);
   let saved = result[BATCH_STATE_KEY];
   if (!saved) {
@@ -1160,12 +1182,19 @@ async function getBatchState() {
     saved = legacy[BATCH_STATE_KEY];
     if (saved) {
       const migrated = persistedBatchState(saved);
-      await chrome.storage.local.set({ [BATCH_STATE_KEY]: migrated });
-      await chrome.storage.session.remove(BATCH_STATE_KEY);
+      const migration = batchStateWriteQueue.catch(() => undefined).then(async () => {
+        if (batchClearing || batchEpoch !== requestEpoch) return;
+        await chrome.storage.local.set({ [BATCH_STATE_KEY]: migrated });
+        await chrome.storage.session.remove(BATCH_STATE_KEY);
+      });
+      batchStateWriteQueue = migration;
+      await migration;
       saved = migrated;
     }
   }
+  if (batchEpoch !== requestEpoch) return emptyBatchState();
   if (!saved || !Array.isArray(saved.tasks)) return emptyBatchState();
+  if (!activeBatchRunId && saved.runId) activeBatchRunId = saved.runId;
   return {
     ...emptyBatchState(),
     ...persistedBatchState(saved),
@@ -1175,10 +1204,19 @@ async function getBatchState() {
 
 async function saveBatchState(state) {
   const saved = persistedBatchState(state);
-  updateBatchKeepAwake(saved);
-  await chrome.storage.local.set({ [BATCH_STATE_KEY]: saved });
-  if (saved.status === "running") await chrome.storage.session.set({ [BATCH_SESSION_KEY]: true });
-  void chrome.runtime.sendMessage({ type: "batchStateChanged" }).catch(() => undefined);
+  const write = batchStateWriteQueue.catch(() => undefined).then(async () => {
+    if ((batchClearing && saved.status !== "clearing") || (activeBatchRunId && saved.runId !== activeBatchRunId)) return;
+    updateBatchKeepAwake(saved);
+    await chrome.storage.local.set({ [BATCH_STATE_KEY]: saved });
+    if (saved.status === "running") await chrome.storage.session.set({ [BATCH_SESSION_KEY]: true });
+    void chrome.runtime.sendMessage({ type: "batchStateChanged" }).catch(() => undefined);
+  });
+  batchStateWriteQueue = write;
+  return write;
+}
+
+function batchCanAdvance(state) {
+  return !batchClearing && state?.status === "running" && (!activeBatchRunId || state.runId === activeBatchRunId);
 }
 
 function batchTask(state) {
@@ -1331,7 +1369,12 @@ async function ensureBatchWorker(state, task) {
     }
   }
   await appendBatchLog("worker_tab_creating", state, "正在创建工作标签页");
+  if (batchClearing) return null;
   const tab = await chrome.tabs.create({ url: task.pageUrl, active: false });
+  if (batchClearing) {
+    await chrome.tabs.remove(tab.id).catch(() => undefined);
+    return null;
+  }
   state.workerTabId = tab.id;
   task.status = "navigating";
   task.phaseStartedAt = Date.now();
@@ -1343,11 +1386,11 @@ async function ensureBatchWorker(state, task) {
 }
 
 function queueBatchAdvance() {
-  setTimeout(() => void advanceBatchQueue(), 0);
+  if (!batchClearing) setTimeout(() => void advanceBatchQueue(), 0);
 }
 
 function scheduleBatchTick() {
-  setTimeout(() => void advanceBatchQueue(), 1000);
+  if (!batchClearing) setTimeout(() => void advanceBatchQueue(), 1000);
 }
 
 async function failBatchTask(state, task, error) {
@@ -1360,6 +1403,7 @@ async function failBatchTask(state, task, error) {
 }
 
 async function extractBatchTranscript(state, task, workerTabId) {
+  if (!batchCanAdvance(state)) return;
   if (Date.now() - Number(task.phaseStartedAt || 0) > TRANSCRIPT_EXTRACT_TIMEOUT_MS) {
     return failBatchTask(state, task, "逐字稿提取超时。");
   }
@@ -1372,17 +1416,21 @@ async function extractBatchTranscript(state, task, workerTabId) {
 
   try {
     const result = await chrome.tabs.sendMessage(workerTabId, { type: "runBatchTranscript" });
+    if (!batchCanAdvance(state)) return;
     if (!result?.transcriptFound || typeof result.fullText !== "string" || !result.fullText.trim()) {
       return failBatchTask(state, task, "页面中未找到逐字稿正文。");
     }
     const page = await getPageInfo(workerTabId);
+    if (!batchCanAdvance(state)) return;
     task.pageTitle = result.pageTitle || page.title || task.pageTitle || "";
     task.recordingTitle = result.recordingTitle || page.recordingTitle || task.recordingTitle || "";
     task.transcriptText = result.fullText.trim();
     task.paragraphCount = Number(result.paragraphCount) || 0;
     task.textLength = task.transcriptText.length;
     await appendBatchLog("transcript_extracted", state, `提取完成：${task.textLength} 字，${task.paragraphCount} 段`);
+    if (!batchCanAdvance(state)) return;
     await exportTranscriptTask(state, task);
+    if (!batchCanAdvance(state)) return;
     task.status = "complete";
     task.error = "";
     task.phaseStartedAt = 0;
@@ -1391,15 +1439,25 @@ async function extractBatchTranscript(state, task, workerTabId) {
     await appendBatchLog("task_complete", state, `逐字稿任务完成：${transcriptTaskTitle(task)}`);
     queueBatchAdvance();
   } catch (error) {
-    await failBatchTask(state, task, error?.message || "逐字稿提取失败。");
+    if (batchCanAdvance(state)) await failBatchTask(state, task, error?.message || "逐字稿提取失败。");
   }
 }
 
-async function advanceBatchQueue() {
-  if (batchAdvancing) return;
+function advanceBatchQueue() {
+  if (batchClearing || batchAdvancing) return batchAdvancePromise || Promise.resolve();
+  const work = runBatchAdvance();
+  batchAdvancePromise = work;
+  void work.finally(() => {
+    if (batchAdvancePromise === work) batchAdvancePromise = null;
+  }).catch(() => undefined);
+  return work;
+}
+
+async function runBatchAdvance() {
   batchAdvancing = true;
   try {
     const state = await getBatchState();
+    if (batchClearing || (activeBatchRunId && state.runId !== activeBatchRunId)) return;
     const pausedDownload = state.status === "paused" && batchTask(state)?.status === "downloading";
     if (state.status !== "running" && !pausedDownload) return;
 
@@ -1407,6 +1465,7 @@ async function advanceBatchQueue() {
     if (!task || ["complete", "failed"].includes(task.status)) {
       const nextIndex = nextPendingBatchIndex(state);
       if (nextIndex < 0) {
+        if (batchClearing) return;
         try {
           await finalizeTranscriptExport(state);
         } catch (error) {
@@ -1449,6 +1508,7 @@ async function advanceBatchQueue() {
       if (!task.taskId) return failBatchTask(state, task, "本地下载任务编号丢失。");
       try {
         const download = await getLocalDownloadStatus(task.taskId);
+        if (batchClearing) return;
         Object.assign(task, {
           bytes: Number(download.bytes) || 0,
           totalBytes: Number.isFinite(download.totalBytes) ? download.totalBytes : null,
@@ -1482,7 +1542,9 @@ async function advanceBatchQueue() {
       return;
     }
 
+    if (batchClearing) return;
     const workerTabId = await ensureBatchWorker(state, task);
+    if (batchClearing) return;
     if (task.status === "pending") {
       task.status = "navigating";
       task.phaseStartedAt = Date.now();
@@ -1518,6 +1580,7 @@ async function advanceBatchQueue() {
     }
     await chrome.tabs.sendMessage(workerTabId, { type: "scanPageMedia" }).catch(() => undefined);
     const [candidates, page] = await Promise.all([getCandidates(workerTabId), getPageInfo(workerTabId)]);
+    if (batchClearing) return;
     task.pageTitle = page.title || task.pageTitle || "";
     task.recordingTitle = page.recordingTitle || task.recordingTitle || "";
     const mp4Count = candidates.filter((candidate) => candidate.kind === "mp4").length;
@@ -1543,7 +1606,7 @@ async function advanceBatchQueue() {
     state.statusMessage = "正在准备下载…";
     await saveBatchState(state);
     await appendBatchLog("media_prepare_started", state, "正在准备下载上下文");
-    if ((await getBatchState()).status !== "running") return;
+    if (!batchCanAdvance(await getBatchState())) return;
     try {
       const started = await prepareCandidateAndStartDownload(
         {
@@ -1556,6 +1619,7 @@ async function advanceBatchQueue() {
         },
         { trackActiveDownload: false }
       );
+      // A download already handed to the Native Host must remain traceable while history is clearing.
       task.status = "downloading";
       task.taskId = started.taskId;
       task.filename = started.filename || task.filename;
@@ -1563,13 +1627,18 @@ async function advanceBatchQueue() {
       task.totalBytes = null;
       task.progress = null;
       state.statusMessage = "下载中…";
+      if (batchClearing) {
+        batchClearingTaskId = started.taskId;
+        return;
+      }
       await saveBatchState(state);
       await appendBatchLog("local_download_submitted", state, "已提交本地下载组件");
       queueBatchAdvance();
     } catch (error) {
-      await failBatchTask(state, task, error.message === "自动准备失败，请播放视频后重试。" ? "媒体上下文准备失败。" : error.message);
+      if (!batchClearing) await failBatchTask(state, task, error.message === "自动准备失败，请播放视频后重试。" ? "媒体上下文准备失败。" : error.message);
     }
   } catch (error) {
+    if (batchClearing) return;
     const state = await getBatchState();
     state.status = "failed";
     state.error = safeBatchLogText(error?.message || "批量调度发生未知错误。");
@@ -1582,6 +1651,9 @@ async function advanceBatchQueue() {
 }
 
 async function saveBatchDraft(message) {
+  if (batchClearing) throw new Error("批量历史正在清空。");
+  if (batchStartPromise) throw new Error("批量任务正在启动，暂不能修改链接。");
+  const requestEpoch = batchEpoch;
   const items = Array.isArray(message.items) ? message.items : [];
   const accepted = items
     .filter((item) => typeof item?.url === "string" && /^https?:\/\/meeting\.tencent\.com\/(?:crm|cw)\//i.test(item.url))
@@ -1590,30 +1662,63 @@ async function saveBatchDraft(message) {
     items: accepted,
     duplicateCount: Number(message.duplicateCount) || 0,
     invalidCount: Number(message.invalidCount) || 0,
+    invalidLinks: Array.isArray(message.invalidLinks) ? message.invalidLinks : [],
     updatedAt: new Date().toISOString()
   };
   const existing = await getBatchState();
-  if (existing.status === "running") throw new Error("批量下载正在运行，不能替换任务列表。");
+  if (["starting", "running", "clearing"].includes(existing.status)) throw new Error("批量任务正在运行，不能替换任务列表。");
   await appendBatchLog("batch_parse_received", existing, `前端提交 ${items.length} 条`);
-  await chrome.storage.local.set({ [BATCH_DRAFT_KEY]: persistedBatchDraft(draft) });
+  await writeBatchDraft(draft, requestEpoch);
   await appendBatchLog("batch_draft_saved", existing, `后台接受 ${accepted.length} 条`);
   return { ...draft, acceptedCount: accepted.length };
 }
 
-async function startBatch(message) {
-  const requestedItems = Array.isArray(message.items) ? message.items : (await getBatchDraft()).items;
+function writeBatchDraft(draft, requestEpoch) {
+  const write = batchDraftWriteQueue.catch(() => undefined).then(async () => {
+    if (batchClearing || batchEpoch !== requestEpoch) throw new Error("批量历史已清空，请重新解析链接。");
+    await chrome.storage.local.set({ [BATCH_DRAFT_KEY]: persistedBatchDraft(draft) });
+  });
+  batchDraftWriteQueue = write;
+  return write;
+}
+
+function startBatch(message) {
+  if (batchClearing || batchStartPromise) return Promise.reject(new Error("批量任务正在切换，请稍后重试。"));
+  const work = startNewBatch(message);
+  batchStartPromise = work;
+  void work.finally(() => {
+    if (batchStartPromise === work) batchStartPromise = null;
+  }).catch(() => undefined);
+  return work;
+}
+
+async function startNewBatch(message) {
+  let requestEpoch = batchEpoch;
+  const draft = await getBatchDraft();
+  const requestedItems = draft.items;
+  if (Array.isArray(message.items) && (message.items.length !== requestedItems.length
+    || message.items.some((item, index) => item?.url !== requestedItems[index]?.url))) {
+    throw new Error("解析结果已变化，请重新解析链接后再开始。");
+  }
   const accepted = requestedItems
     .filter((item) => typeof item?.url === "string" && /^https?:\/\/meeting\.tencent\.com\/(?:crm|cw)\//i.test(item.url))
     .map((item) => item.url);
   const previous = await getBatchState();
-  const taskType = ["video", "transcript"].includes(message.taskType) ? message.taskType : previous.taskType || "video";
+  const taskType = ["video", "transcript"].includes(message.taskType) ? message.taskType : "video";
   const transcriptExportMode = ["unified", "hierarchical"].includes(message.transcriptExportMode)
     ? message.transcriptExportMode
     : previous.transcriptExportMode || "hierarchical";
   await appendBatchLog("batch_start_requested", previous, `请求启动 ${accepted.length} 条`);
   if (!accepted.length) throw new Error("请先解析至少一条腾讯会议链接。");
-  if (previous.status === "running") return previous;
-  if (previous.status === "paused" && previous.tasks.length) return resumeBatch(message.mediaPreference);
+  if (["running", "starting", "clearing"].includes(previous.status) || batchClearing) {
+    throw new Error("当前批量任务仍在运行，请先暂停或清空历史。");
+  }
+  if (previous.status === "paused" && previous.tasks.length) {
+    if (!message.replacePaused) throw new Error("存在未完成历史任务，开始新任务将放弃旧队列，请先确认。");
+    await clearBatchHistory();
+    requestEpoch = batchEpoch;
+    await writeBatchDraft(draft, requestEpoch);
+  }
   if (taskType === "video") {
     const health = await checkLocalDownloader();
     if (!health.ok) {
@@ -1622,9 +1727,13 @@ async function startBatch(message) {
     }
     await appendBatchLog("batch_health_ok", previous, "本地下载组件已就绪");
   }
+  if (batchClearing || batchEpoch !== requestEpoch) throw new Error("正在清空批量历史，请稍后重试。");
+  const runId = crypto.randomUUID();
+  activeBatchRunId = runId;
   const exportTimestamp = transcriptExportTimestamp();
   const state = {
     ...emptyBatchState(),
+    runId,
     status: "starting",
     startedAt: new Date().toISOString(),
     taskType,
@@ -1644,6 +1753,7 @@ async function startBatch(message) {
     ? message.mediaPreference
     : previous.mediaPreference || "auto";
   await saveBatchState(state);
+  if (batchClearing || batchEpoch !== requestEpoch) throw new Error("批量任务已取消启动。");
   await appendBatchLog("batch_state_created", state, `已创建 ${state.tasks.length} 条执行任务`);
   const verified = await getBatchState();
   if (verified.tasks.length !== accepted.length) {
@@ -1654,12 +1764,18 @@ async function startBatch(message) {
   verified.status = "running";
   verified.statusMessage = "正在创建工作标签页…";
   await saveBatchState(verified);
+  if (batchClearing || batchEpoch !== requestEpoch) throw new Error("批量任务已取消启动。");
   await chrome.alarms.create(BATCH_ALARM_NAME, { periodInMinutes: 0.5 });
+  if (batchClearing || batchEpoch !== requestEpoch) {
+    await chrome.alarms.clear(BATCH_ALARM_NAME);
+    throw new Error("批量任务已取消启动。");
+  }
   await advanceBatchQueue();
   return getBatchState();
 }
 
 async function pauseBatch() {
+  if (batchClearing) return getBatchState();
   const state = await getBatchState();
   if (state.status === "running") {
     state.status = "paused";
@@ -1671,8 +1787,10 @@ async function pauseBatch() {
 }
 
 async function resumeBatch(preference) {
+  if (batchClearing) throw new Error("批量历史正在清空。");
+  if (batchStartPromise) throw new Error("新批量任务正在启动。");
   const state = await getBatchState();
-  if (state.status !== "paused") return state;
+  if (state.status !== "paused" || !state.tasks.length) throw new Error("没有可继续的暂停任务。");
   state.status = "running";
   state.statusMessage = "正在继续批量任务…";
   if (["auto", "screen", "speaker"].includes(preference)) state.mediaPreference = preference;
@@ -1683,7 +1801,64 @@ async function resumeBatch(preference) {
   return getBatchState();
 }
 
+function clearBatchHistory() {
+  if (batchClearPromise) return batchClearPromise;
+  batchClearing = true;
+  batchEpoch += 1;
+  const work = (async () => {
+    await chrome.alarms.clear(BATCH_ALARM_NAME);
+    if (batchAdvancePromise) await batchAdvancePromise.catch(() => undefined);
+    await batchStateWriteQueue.catch(() => undefined);
+    await batchDraftWriteQueue.catch(() => undefined);
+    const state = await getBatchState();
+    const workerTabId = state.workerTabId;
+    if (batchClearingTaskId && batchTask(state)) {
+      batchTask(state).status = "downloading";
+      batchTask(state).taskId = batchClearingTaskId;
+    }
+    const taskId = batchClearingTaskId || (batchTask(state)?.status === "downloading" ? batchTask(state).taskId : "");
+    if (batchTask(state)?.status === "downloading" && !taskId) {
+      throw new Error("当前 MP4 下载编号暂不可用，无法安全清空；请等待下载状态恢复后重试。");
+    }
+    state.status = "clearing";
+    state.statusMessage = taskId ? "正在等待当前 MP4 安全下载完成，再清空历史…" : "正在停止批量任务并清空历史…";
+    await saveBatchState(state);
+    if (taskId) {
+      let download;
+      do {
+        download = await getLocalDownloadStatus(taskId);
+        if (!["complete", "failed"].includes(download.status)) await new Promise((resolve) => setTimeout(resolve, 1000));
+      } while (!["complete", "failed"].includes(download.status));
+    }
+    if (Number.isInteger(workerTabId)) {
+      try {
+        await chrome.tabs.remove(workerTabId);
+      } catch {
+        // The worker tab may have been closed already.
+      }
+    }
+    await chrome.alarms.clear(BATCH_ALARM_NAME);
+    await batchStateWriteQueue.catch(() => undefined);
+    await batchLogQueue.catch(() => undefined);
+    await chrome.storage.local.remove([BATCH_DRAFT_KEY, BATCH_STATE_KEY]);
+    await chrome.storage.session.remove([BATCH_DRAFT_KEY, BATCH_STATE_KEY, BATCH_LOG_KEY, BATCH_SESSION_KEY]);
+    activeBatchRunId = crypto.randomUUID();
+    batchClearingTaskId = "";
+    updateBatchKeepAwake(emptyBatchState());
+    void chrome.runtime.sendMessage({ type: "batchStateChanged" }).catch(() => undefined);
+    void chrome.runtime.sendMessage({ type: "batchLogChanged" }).catch(() => undefined);
+    return emptyBatchState();
+  })();
+  batchClearPromise = work;
+  void work.finally(() => {
+    if (batchClearPromise === work) batchClearPromise = null;
+    batchClearing = false;
+  }).catch(() => undefined);
+  return work;
+}
+
 async function retryBatchTask(index) {
+  if (batchClearing) throw new Error("批量历史正在清空。 ");
   const state = await getBatchState();
   const task = state.tasks[index];
   if (!task || task.status !== "failed") throw new Error("只能重试失败任务。");
@@ -1694,9 +1869,10 @@ async function retryBatchTask(index) {
 }
 
 async function notifyBatchMetadata(tabId, metadata) {
+  if (batchClearing) return;
   const state = await getBatchState();
   const task = batchTask(state);
-  if (state.status !== "running" || state.workerTabId !== tabId || !task) return;
+  if (!batchCanAdvance(state) || state.workerTabId !== tabId || !task) return;
   task.pageTitle = metadata.pageTitle || task.pageTitle || "";
   task.recordingTitle = metadata.recordingTitle || task.recordingTitle || "";
   if (task.status === "extracting" || task.status === "complete") return;
@@ -1711,9 +1887,10 @@ async function notifyBatchMetadata(tabId, metadata) {
 }
 
 async function notifyBatchMediaObserved(tabId) {
+  if (batchClearing) return;
   const state = await getBatchState();
   const task = batchTask(state);
-  if (state.status === "running" && state.workerTabId === tabId && task?.status === "detecting") {
+  if (batchCanAdvance(state) && state.workerTabId === tabId && task?.status === "detecting") {
     queueBatchAdvance();
   }
 }
@@ -1780,7 +1957,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       const state = await getBatchState();
       const task = batchTask(state);
       const progress = message.progress || {};
-      if (state.status !== "running" || state.taskType !== "transcript" || state.workerTabId !== sender.tab.id || !task) {
+      if (!batchCanAdvance(state) || state.taskType !== "transcript" || state.workerTabId !== sender.tab.id || !task) {
         void chrome.runtime.sendMessage({
           type: "transcriptProgress",
           tabId: sender.tab.id,
@@ -1925,10 +2102,17 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     return true;
   }
 
+  if (message?.type === "clearBatchHistory") {
+    clearBatchHistory()
+      .then((state) => sendResponse(state))
+      .catch((error) => sendResponse({ error: error.message }));
+    return true;
+  }
+
   if (message?.type === "getBatchState") {
     getBatchState()
       .then(async (state) => {
-        if (state.status === "running" || (state.status === "paused" && batchTask(state)?.status === "downloading")) {
+        if (!batchClearing && (state.status === "running" || (state.status === "paused" && batchTask(state)?.status === "downloading"))) {
           void advanceBatchQueue();
         }
         sendResponse(state);
@@ -1973,7 +2157,7 @@ chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
     void (async () => {
       const state = await getBatchState();
       const task = batchTask(state);
-      if (state.status !== "running" || state.workerTabId !== tabId || !task || task.status !== "navigating") return;
+      if (!batchCanAdvance(state) || state.workerTabId !== tabId || !task || task.status !== "navigating") return;
       task.status = "detecting";
       task.phaseStartedAt = Date.now();
       state.statusMessage = state.taskType === "transcript" ? "页面加载完成，准备采集逐字稿…" : "正在检测 MP4…";
@@ -1990,7 +2174,7 @@ chrome.tabs.onRemoved.addListener((tabId) => {
   void chrome.storage.session.remove([candidatesKey(tabId), pageKey(tabId)]);
   void (async () => {
     const state = await getBatchState();
-    if (state.status === "running" && state.workerTabId === tabId) {
+    if (!batchClearing && state.status === "running" && state.workerTabId === tabId) {
       state.status = "paused";
       state.workerTabId = null;
       await saveBatchState(state);
@@ -1999,7 +2183,7 @@ chrome.tabs.onRemoved.addListener((tabId) => {
 });
 
 chrome.alarms.onAlarm.addListener((alarm) => {
-  if (alarm.name === BATCH_ALARM_NAME) void advanceBatchQueue();
+  if (!batchClearing && alarm.name === BATCH_ALARM_NAME) void advanceBatchQueue();
 });
 
 async function recoverInterruptedBatch(state) {
@@ -2039,6 +2223,10 @@ async function recoverInterruptedBatch(state) {
 function restoreBatchQueue() {
   void (async () => {
     const state = await getBatchState();
+    if (state.status === "clearing") {
+      void clearBatchHistory().catch(() => undefined);
+      return;
+    }
     if (!["running", "starting"].includes(state.status)) {
       updateBatchKeepAwake(state);
       return;
